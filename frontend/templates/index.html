@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row">
+  <div class="col-12">
+    <h1>게시글 목록</h1>
+    
+    <div class="table-responsive mt-4">
+      <table class="table table-striped">
+        <thead class="table-dark">
+          <tr>
+            <th>번호</th>
+            <th>제목</th>
+            <th>작성자</th>
+            <th>첨부파일</th>
+            <th>작성일</th>
+            {% if session.username %}
+            <th>관리</th>
+            {% endif %}
+          </tr>
+        </thead>
+        <tbody>
+          {# 게시글이 없을 때 #}
+          {% if posts_data.posts|length == 0 %}
+          <tr>
+            <td colspan="{% if session.username %}6{% else %}5{% endif %}" class="text-center">
+              게시글이 없습니다.
+            </td>
+          </tr>
+          {% else %}
+            {# 게시글 루프 #}
+            {% for post in posts_data.posts %}
+            <tr>
+              <td>{{ post.id }}</td>
+              <td>
+                <a href="{{ url_for('view_post', post_id=post.id) }}" class="text-decoration-none">
+                  {{ post.title }}
+                </a>
+              </td>
+              <td>{{ post.author_name }}</td>
+              <td>
+                {% if post.file_id %}
+                <a href="{{ url_for('download_file', file_id=post.file_id) }}"
+                   class="btn btn-sm btn-outline-primary">
+                  {{ post.file_name }}
+                </a>
+                {% endif %}
+              </td>
+              <td>{{ post.created_at }}</td>
+              {% if session.username %}
+              <td>
+                <a href="{{ url_for('delete_post', post_id=post.id) }}"
+                   class="btn btn-sm btn-danger"
+                   onclick="return confirm('정말 삭제하시겠습니까?');">
+                  삭제
+                </a>
+              </td>
+              {% endif %}
+            </tr>
+            {% endfor %}
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+
+    {# 페이징 #}
+    {% if posts_data.pages > 1 %}
+    <nav aria-label="Page navigation">
+      <ul class="pagination justify-content-center">
+        {% if posts_data.current_page > 1 %}
+        <li class="page-item">
+          <a class="page-link" href="{{ url_for('index', page=posts_data.current_page-1) }}">이전</a>
+        </li>
+        {% endif %}
+
+        {% for page_num in range(1, posts_data.pages + 1) %}
+          {% if page_num == posts_data.current_page %}
+          <li class="page-item active">
+            <span class="page-link">{{ page_num }}</span>
+          </li>
+          {% else %}
+          <li class="page-item">
+            <a class="page-link" href="{{ url_for('index', page=page_num) }}">{{ page_num }}</a>
+          </li>
+          {% endif %}
+        {% endfor %}
+
+        {% if posts_data.current_page < posts_data.pages %}
+        <li class="page-item">
+          <a class="page-link" href="{{ url_for('index', page=posts_data.current_page+1) }}">다음</a>
+        </li>
+        {% endif %}
+      </ul>
+    </nav>
+    {% endif %}
+
+  </div>
+</div>
+{% endblock %}
