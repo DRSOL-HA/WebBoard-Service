@@ -11,8 +11,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN mkdir -p /app/uploads
-
 EXPOSE 5003
 
 CMD ["gunicorn", "--bind", "0.0.0.0:5003", "--workers", "2", "app:app"]
