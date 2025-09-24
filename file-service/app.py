@@ -58,16 +58,19 @@ def upload_file():
             file_data = file.read()
             file.seek(0)  # 파일 포인터를 처음으로 되돌림
             
+            # S3 업로드 경로에 파일 저장
+            s3_key = f"{app.config['S3_UPLOADS_PATH']}{unique_filename}"
+            
             s3_client.put_object(
                 Bucket=app.config['S3_BUCKET_NAME'],
-                Key=unique_filename,
+                Key=s3_key,
                 Body=file_data,
                 ContentType=file.content_type or 'application/octet-stream'
             )
             
             return jsonify({
                 'message': '파일이 S3에 업로드되었습니다',
-                'file_id': unique_filename,
+                'file_id': s3_key,  # 전체 S3 경로를 file_id로 반환
                 'original_name': original_filename
             }), 200
         else:
@@ -84,7 +87,7 @@ def download_file(file_id):
     try:
         s3_client = get_s3_client()
         
-        # S3에서 파일 다운로드
+        # S3에서 파일 다운로드 (file_id는 이미 전체 경로를 포함)
         response = s3_client.get_object(
             Bucket=app.config['S3_BUCKET_NAME'],
             Key=file_id
@@ -114,7 +117,7 @@ def get_file_info(file_id):
     try:
         s3_client = get_s3_client()
         
-        # S3에서 파일 정보 확인
+        # S3에서 파일 정보 확인 (file_id는 이미 전체 경로를 포함)
         response = s3_client.head_object(
             Bucket=app.config['S3_BUCKET_NAME'],
             Key=file_id

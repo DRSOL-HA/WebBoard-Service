@@ -14,3 +14,4 @@ class Config:
     AWS_DEFAULT_REGION = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
     S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
     S3_ENDPOINT_URL = os.environ.get('S3_ENDPOINT_URL')  # MinIO 등 다른 S3 호환 서비스용
+    S3_UPLOADS_PATH = os.environ.get('S3_UPLOADS_PATH', 'uploads/')  # S3 업로드 경로
