@@ -1,0 +1,373 @@
+def REPOS = [
+  // 단일 모노레포(WebBoard-Service)에서 서비스별 컨텍스트 빌드
+  'user-service': 'git@github.com:DRSOL-HA/WebBoard-Service.git',
+  'file-service': 'git@github.com:DRSOL-HA/WebBoard-Service.git',
+  'post-service': 'git@github.com:DRSOL-HA/WebBoard-Service.git',
+  'frontend'    : 'git@github.com:DRSOL-HA/WebBoard-Service.git',
+  'nginx'       : 'git@github.com:DRSOL-HA/WebBoard-Service.git',
+]
+
+pipeline {
+  agent {
+    kubernetes {
+      yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins: buildkit
+spec:
+  serviceAccountName: jenkins
+  containers:
+  - name: buildctl
+    image: moby/buildkit:rootless
+    command: ["cat"]
+    tty: true
+    volumeMounts:
+    - { name: tls, mountPath: /tls, readOnly: true }
+    - { name: workspace-volume, mountPath: /home/jenkins/agent, readOnly: false }
+
+  - name: git
+    image: alpine/git:2.45.2
+    command: ["cat"]
+    tty: true
+    securityContext: { runAsUser: 0, runAsGroup: 0 }
+    volumeMounts:
+    - { name: workspace-volume, mountPath: /home/jenkins/agent, readOnly: false }
+
+  - name: yq
+    image: ghcr.io/mikefarah/yq:4
+    command: ["cat"]
+    tty: true
+    securityContext: { runAsUser: 0, runAsGroup: 0 }
+    volumeMounts:
+    - { name: workspace-volume, mountPath: /home/jenkins/agent, readOnly: false }
+
+  volumes:
+  - name: tls
+    secret:
+      secretName: buildkit-client-tls
+  - name: workspace-volume
+    emptyDir: {}
+"""
+    }
+  }
+
+  parameters {
+    choice(
+      name: 'SERVICE',
+      choices: 'user-service\nfile-service\npost-service\nfrontend\nnginx',
+      description: '빌드/배포할 서비스'
+    )
+    string(name: 'BRANCH', defaultValue: 'main', description: '서비스 코드 브랜치')
+    string(name: 'IMAGE_TAG', defaultValue: '', description: '비우면 자동 v<숫자> +1')
+  }
+
+  options {
+    disableConcurrentBuilds()
+    skipDefaultCheckout(true)
+  }
+
+  environment {
+    REGISTRY      = 'ghcr.io/drsol-ha'   // OCI 규칙상 소문자 권장
+    BUILDKIT_ADDR = 'tcp://buildkitd.buildkit.svc.cluster.local:1234'
+  }
+
+  stages {
+
+    stage('Prepare environment') {
+      steps {
+        script {
+          // 비워두면 이후 'Decide IMAGE_TAG'에서 자동 +1 로 결정
+          env.IMAGE_TAG = (params.IMAGE_TAG?.trim()) ?: ''
+          echo "Initial IMAGE_TAG param: ${env.IMAGE_TAG}"
+        }
+      }
+    }
+
+    stage('Checkout service code') {
+      steps {
+        container('git') {
+          script {
+            env.REPO_HTTPS = REPOS[params.SERVICE].replace('git@github.com:', 'https://github.com/')
+          }
+          withEnv(["BRANCH=${params.BRANCH}"]) {
+            withCredentials([usernamePassword(
+              // 🔐 GitHub PAT (Username with password)  ← 네 환경의 ID
+              credentialsId: '2ebc3d3c-d09f-4180-8a21-74f50626cd2b',
+              usernameVariable: 'GH_USER',
+              passwordVariable: 'GH_PAT'
+            )]) {
+              sh '''
+                set -euxo pipefail
+                rm -rf src && mkdir -p src
+
+                # 권한/존재 체크
+                { set +x; } 2>/dev/null
+                git -c http.extraheader="AUTHORIZATION: Basic $(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\n')" \
+                  ls-remote --heads "$REPO_HTTPS" >/dev/null
+                { set -x; } 2>/dev/null || true
+
+                # clone
+                { set +x; } 2>/dev/null
+                git -c http.extraheader="AUTHORIZATION: Basic $(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\n')" \
+                  clone --depth=1 -b "$BRANCH" "$REPO_HTTPS" src/app
+                { set -x; } 2>/dev/null || true
+
+                # 보조 태그용 SHORT_SHA 저장
+                (cd src/app && git rev-parse --short=7 HEAD) > .short_sha
+              '''
+            }
+          }
+        }
+      }
+    }
+
+    stage('Resolve build context') {
+      steps {
+        container('git') {
+          withEnv(["SERVICE=${params.SERVICE}"]) {
+            sh '''
+              set -euxo pipefail
+              HINT="$(printf '%s' "$SERVICE" | sed 's/-service$//')"
+              FOUND=""
+              for c in \
+                "services/${SERVICE}" "services/${HINT}" \
+                "apps/${SERVICE}"     "apps/${HINT}" \
+                "packages/${SERVICE}" "packages/${HINT}" \
+                "${SERVICE}"          "${HINT}" \
+                "apps/${SERVICE}/app" "apps/${HINT}/app" \
+                "services/${SERVICE}/app" "services/${HINT}/app"
+              do
+                if [ -d "src/app/$c" ] && ls "src/app/$c"/Dockerfile* >/dev/null 2>&1; then
+                  FOUND="$c"; break
+                fi
+              done
+
+              [ -n "$FOUND" ] || { echo "ERROR: Dockerfile 경로를 찾지 못함"; exit 2; }
+              echo "Detected build context: $FOUND"
+              echo "$FOUND" > .build_context_path
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Decide IMAGE_TAG (auto bump when empty)') {
+      when { expression { return (env.IMAGE_TAG ?: '') == '' } }
+      steps {
+        container('yq') {
+          withCredentials([usernamePassword(credentialsId: 'ghcr',
+            usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_PAT')]) {
+            withEnv(["SERVICE=${params.SERVICE}"]) {
+              sh '''
+                set -euxo pipefail
+                apk add --no-cache curl >/dev/null 2>&1 || true
+
+                OWNER="drsol-ha"
+                REPO="board-${SERVICE}"
+
+                { set +x; } 2>/dev/null
+                TOKEN=$(curl -fsS -u "$GHCR_USER:$GHCR_PAT" \
+                  "https://ghcr.io/token?service=ghcr.io&scope=repository:${OWNER}/${REPO}:pull" \
+                  | yq -r .token)
+                { set -x; } 2>/dev/null || true
+
+                TAGS_JSON="$(curl -fsS -H "Authorization: Bearer $TOKEN" \
+                  "https://ghcr.io/v2/${OWNER}/${REPO}/tags/list?n=1000")"
+
+                NEXT_TAG="$(printf '%s' "$TAGS_JSON" \
+                  | yq -r '.tags // [] 
+                           | map(select(test("^v[0-9]+$"))) 
+                           | (map(sub("^v";"")|tonumber) | max // 0) 
+                           | . + 1 
+                           | "v"+tostring')"
+
+                [ -n "$NEXT_TAG" ] || NEXT_TAG="v1"
+                echo "$NEXT_TAG" > "$WORKSPACE/.next_tag"
+                echo "Auto-decided IMAGE_TAG: $NEXT_TAG"
+              '''
+            }
+          }
+        }
+        script {
+          env.IMAGE_TAG = readFile('.next_tag').trim()
+          echo "Using IMAGE_TAG=${env.IMAGE_TAG}"
+        }
+      }
+    }
+
+    stage('Build & Push image') {
+      steps {
+        container('buildctl') {
+          withCredentials([usernamePassword(credentialsId: 'ghcr',
+            usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_PAT')]) {
+            withEnv(["SERVICE=${params.SERVICE}"]) {
+              sh '''
+                set -euo pipefail
+                CONTEXT_PATH="$(cat .build_context_path)"
+                IMAGE_NAME="${REGISTRY}/board-${SERVICE}"
+                META="$WORKSPACE/.buildmeta.json"
+                SHORT_SHA="$(cat .short_sha 2>/dev/null || echo unknown)"
+
+                export HOME="$WORKSPACE"
+                export DOCKER_CONFIG="$HOME/.docker"
+                mkdir -p "$DOCKER_CONFIG"
+
+                { set +x; } 2>/dev/null
+                AUTH=$(printf '%s:%s' "$GHCR_USER" "$GHCR_PAT" | base64 | tr -d '\n')
+                cat > "$DOCKER_CONFIG/config.json" <<EOF
+                { "auths": { "ghcr.io": { "auth": "$AUTH" } } }
+                EOF
+                { set -x; } 2>/dev/null || true
+
+                # 여러 태그 동시 푸시 (vN + sha-XXXXXXX)
+                buildctl --addr "$BUILDKIT_ADDR" \
+                  --tlscacert /tls/ca.crt --tlscert /tls/client.crt --tlskey /tls/client.key \
+                  build --frontend=dockerfile.v0 --progress=plain \
+                  --local context="src/app/${CONTEXT_PATH}" \
+                  --local dockerfile="src/app/${CONTEXT_PATH}" \
+                  --output type=image,name="$IMAGE_NAME:${IMAGE_TAG}",name="$IMAGE_NAME:sha-${SHORT_SHA}",push=true \
+                  --metadata-file "$META"
+
+                [ -s "$META" ] || { echo "ERROR: BuildKit metadata file not written: $META"; exit 10; }
+              '''
+            }
+          }
+        }
+      }
+    }
+
+    stage('Extract digest') {
+      steps {
+        container('yq') {
+          withCredentials([usernamePassword(credentialsId: 'ghcr',
+            usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_PAT')]) {
+            withEnv(["SERVICE=${params.SERVICE}"]) {
+              sh '''
+                set -euo pipefail
+                apk add --no-cache curl >/dev/null 2>&1 || true
+
+                OWNER="drsol-ha"
+                REPO="board-${SERVICE}"
+                META="$WORKSPACE/.buildmeta.json"
+                OUT="$WORKSPACE/.image_digest"
+                DIGEST=""
+
+                # 1) 메타파일에서 추출 (BuildKit 표준 키)
+                if [ -s "$META" ]; then
+                  DIGEST=$(yq -r '.["containerimage.digest"] // .containerimage.digest // ""' "$META" || true)
+                fi
+
+                # 2) 실패 시 GHCR에서 표준 HEAD로 조회 (이번 빌드의 태그만)
+                if [ -z "${DIGEST:-}" ]; then
+                  { set +x; } 2>/dev/null
+                  TOKEN=$(curl -fsS -u "$GHCR_USER:$GHCR_PAT" \
+                    "https://ghcr.io/token?service=ghcr.io&scope=repository:${OWNER}/${REPO}:pull" \
+                    | yq -r .token)
+                  { set -x; } 2>/dev/null || true
+
+                  HDR=$(curl -fsSI \
+                    -H "Authorization: Bearer $TOKEN" \
+                    -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json" \
+                    "https://ghcr.io/v2/${OWNER}/${REPO}/manifests/${IMAGE_TAG}" || true)
+
+                  CODE=$(printf '%s\n' "$HDR" | head -1 | awk '{print $2}')
+                  if [ "$CODE" = "200" ]; then
+                    DIGEST=$(printf '%s\n' "$HDR" \
+                      | awk 'BEGIN{IGNORECASE=1}/^Docker-Content-Digest:/{print $2}' \
+                      | tr -d "\r")
+                  else
+                    echo "WARN: registry returned $CODE for ${OWNER}/${REPO}:${IMAGE_TAG}" >&2
+                  fi
+                fi
+
+                [ -n "$DIGEST" ] || { echo "ERROR: failed to obtain digest (meta & registry both failed)"; exit 11; }
+
+                echo "$DIGEST" > "$OUT"
+                echo "Resolved digest: $DIGEST"
+              '''
+            }
+          }
+        }
+      }
+    }
+
+    stage('Bump manifest (pin by digest)') {
+      steps {
+        // deploy_manifest clone (HTTPS + PAT)
+        container('git') {
+          withCredentials([usernamePassword(
+            credentialsId: '2ebc3d3c-d09f-4180-8a21-74f50626cd2b', // GitHub PAT
+            usernameVariable: 'GH_USER',
+            passwordVariable: 'GH_PAT'
+          )]) {
+            sh '''
+              set -euxo pipefail
+              rm -rf manifest && mkdir -p manifest
+              cd manifest
+              { set +x; } 2>/dev/null
+              git -c http.extraheader="AUTHORIZATION: Basic $(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\n')" \
+                clone --depth=1 https://github.com/DRSOL-HA/deploy_manifest.git repo
+              { set -x; } 2>/dev/null || true
+              cd repo
+              git config user.name  "jenkins"
+              git config user.email "ci@drsol-ha.local"
+            '''
+          }
+        }
+
+        // yq로 digest 핀 (해당 name의 newTag 제거)
+        container('yq') {
+          withEnv(["SERVICE=${params.SERVICE}"]) {
+            sh '''
+              set -euxo pipefail
+              cd manifest/repo
+              FILE="apps/board/kustomization.yaml"
+              [ -f "$FILE" ] || FILE="apps/webboard/kustomization.yaml"
+              [ -f "$FILE" ] || { echo "ERROR: kustomization.yaml not found"; exit 3; }
+
+              export IMG="ghcr.io/drsol-ha/board-${SERVICE}"
+              export DIGEST="$(cat "$WORKSPACE/.image_digest")"
+
+              # 해당 이미지 항목의 .digest 를 쓰고 .newTag 는 제거
+              yq -i '
+                (.images[] | select(.name == strenv(IMG)))
+                |= (.digest = strenv(DIGEST)) |
+                del(.images[] | select(.name == strenv(IMG)).newTag)
+              ' "$FILE"
+
+              echo "Pinned ${IMG} to ${DIGEST}"
+              yq '.images[] | select(.name == strenv(IMG))' "$FILE"
+            '''
+          }
+        }
+
+        // commit & push
+        container('git') {
+          withCredentials([usernamePassword(
+            credentialsId: '2ebc3d3c-d09f-4180-8a21-74f50626cd2b',
+            usernameVariable: 'GH_USER',
+            passwordVariable: 'GH_PAT'
+          )]) {
+            sh '''
+              set -euxo pipefail
+              cd manifest/repo
+              if git diff --quiet -- .; then
+                echo "No manifest changes to commit."
+              else
+                SHORT=$(cut -c8-19 "$WORKSPACE/.image_digest" 2>/dev/null || echo "")
+                git add -A
+                git commit -m "ci: pin board-${SERVICE} to digest ${SHORT:-$(cat "$WORKSPACE/.image_digest")}"
+                { set +x; } 2>/dev/null
+                git -c http.extraheader="AUTHORIZATION: Basic $(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\n')" \
+                  push origin HEAD:main
+                { set -x; } 2>/dev/null || true
+              fi
+            '''
+          }
+        }
+      }
+    }
+  }
+}
