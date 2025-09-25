@@ -250,6 +250,10 @@ spec:
     }
 
     stage('Bump manifest tag') {
+      when {
+        expression { fileExists('.push_ok') }  // 이미지 푸시 성공했을 때만 진행
+      }
+      
       steps {
         container('git') {
           withCredentials([usernamePassword(
