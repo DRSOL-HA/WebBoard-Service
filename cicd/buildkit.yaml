@@ -1,0 +1,76 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: buildkit
+  labels:
+    pod-security.kubernetes.io/enforce: "privileged"
+    pod-security.kubernetes.io/audit:   "privileged"
+    pod-security.kubernetes.io/warn:    "privileged"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: buildkitd
+  namespace: buildkit
+  labels: { app: buildkitd }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: buildkitd }
+  template:
+    metadata:
+      labels: { app: buildkitd }
+    spec:
+      containers:
+      - name: buildkitd
+        image: moby/buildkit:latest       # ★ rootless 아님
+        args:
+          - --addr=tcp://0.0.0.0:1234
+          - --tlscacert=/tls/ca.crt
+          - --tlscert=/tls/server.crt
+          - --tlskey=/tls/server.key
+          - --debug
+        ports:
+          - { name: grpc, containerPort: 1234 }
+        securityContext:
+          privileged: true                # ★ rootful에 필요
+          allowPrivilegeEscalation: true
+          readOnlyRootFilesystem: false
+          seccompProfile: { type: RuntimeDefault }
+        volumeMounts:
+          - { name: tls,   mountPath: /tls, readOnly: true }
+          - { name: state, mountPath: /var/lib/buildkit }  # 상태/캐시
+          - { name: tmp,   mountPath: /tmp }
+      volumes:
+        - name: tls
+          secret: { secretName: buildkit-tls }  # 이미 만들어둔 서버용 TLS 시크릿
+        - name: state
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildkitd
+  namespace: buildkit
+spec:
+  type: ClusterIP
+  selector: { app: buildkitd }
+  ports:
+    - { name: grpc, port: 1234, targetPort: grpc }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: buildkitd-allow-from-ci
+  namespace: buildkit
+spec:
+  podSelector: { matchLabels: { app: buildkitd } }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ci
+      ports: [{ protocol: TCP, port: 1234 }]
