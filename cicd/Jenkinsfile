@@ -30,6 +30,8 @@ spec:
     image: alpine/git:2.45.2
     command: ["cat"]
     tty: true
+    # git이 만드는 파일 소유자 일관성 위해 root
+    securityContext: { runAsUser: 0, runAsGroup: 0 }
     volumeMounts:
     - { name: workspace-volume, mountPath: /home/jenkins/agent }
 
@@ -37,17 +39,16 @@ spec:
     image: ghcr.io/mikefarah/yq:4
     command: ["cat"]
     tty: true
+    # yq도 root로 실행해 파일 쓰기 보장
+    securityContext: { runAsUser: 0, runAsGroup: 0 }
     volumeMounts:
     - { name: workspace-volume, mountPath: /home/jenkins/agent }
 
-  # curl 전용 컨테이너: 쉘 보장 + root로 apk 설치 허용
   - name: curl
     image: alpine:3.20
     command: ["cat"]
     tty: true
-    securityContext:
-      runAsUser: 0
-      runAsGroup: 0
+    securityContext: { runAsUser: 0, runAsGroup: 0 }
     volumeMounts:
     - { name: workspace-volume, mountPath: /home/jenkins/agent }
 
@@ -69,14 +70,14 @@ spec:
   parameters {
     choice(name: 'SERVICE',
            choices: 'user-service\nfile-service\npost-service\nfrontend',
-           description: '빌드/배포할 대상 서비스')
-    string(name: 'BRANCH', defaultValue: 'main', description: '빌드할 브랜치')
+           description: '빌드/배포할 서비스')
+    string(name: 'BRANCH', defaultValue: 'main', description: '빌드 브랜치')
     string(name: 'IMAGE_TAG', defaultValue: '', description: '비우면 서비스별 자동 증가(vN)')
   }
 
   environment {
     REPO_HTTPS    = 'https://github.com/DRSOL-HA/WebBoard-Service.git'
-    REGISTRY      = 'ghcr.io/drsol-ha'         // OCI 권장 소문자
+    REGISTRY      = 'ghcr.io/drsol-ha'
     BUILDKIT_ADDR = 'tcp://buildkitd.buildkit.svc.cluster.local:1234'
   }
 
@@ -87,7 +88,7 @@ spec:
         container('git') {
           withEnv(["BRANCH=${params.BRANCH}"]) {
             withCredentials([usernamePassword(
-              credentialsId: 'GITHUB_PAT', // <-- Jenkins의 GitHub PAT ID
+              credentialsId: 'GITHUB_PAT',
               usernameVariable: 'GH_USER',
               passwordVariable: 'GH_PAT'
             )]) {
@@ -95,7 +96,7 @@ spec:
                 set -euxo pipefail
                 rm -rf src && mkdir -p src
                 AUTH=$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\n')
-                git -c http.extraheader="AUTHORIZATION: Basic ${AUTH}" \
+                git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH}" \
                   clone --depth=1 -b "$BRANCH" "$REPO_HTTPS" src/app
               '''
             }
@@ -125,8 +126,8 @@ spec:
                 fi
               done
               [ -n "$FOUND" ] || { echo "ERROR: Dockerfile 경로 탐색 실패"; exit 2; }
-              echo "Detected build context: $FOUND"
               echo "$FOUND" > .build_context_path
+              echo "Detected build context: $FOUND"
             '''
           }
         }
@@ -136,27 +137,33 @@ spec:
     stage('Decide IMAGE_TAG (auto bump when empty)') {
       when { expression { return !(params.IMAGE_TAG?.trim()) } }
       steps {
-        // curl 준비 + GHCR 태그 조회
         container('curl') {
           withCredentials([usernamePassword(credentialsId: 'ghcr',
             usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_PAT')]) {
             withEnv(["SERVICE=${params.SERVICE}"]) {
               sh '''
                 set -euxo pipefail
-                # curl 설치 (알파인 + root)
                 apk add --no-cache curl ca-certificates
-
                 OWNER="drsol-ha"
                 REPO="board-${SERVICE}"
-                if ! curl -fsS -H "Authorization: Bearer ${GHCR_PAT}" \
-                  "https://ghcr.io/v2/${OWNER}/${REPO}/tags/list?n=1000" > tags.json; then
+                URL="https://ghcr.io/v2/${OWNER}/${REPO}/tags/list?n=1000"
+
+                CODE=$(curl -sS -o tags.json -w "%{http_code}" \
+                  -H "Authorization: Bearer ${GHCR_PAT}" "$URL" || true)
+
+                if [ "$CODE" = "403" ]; then
+                  echo "ERROR: GHCR 403 (PAT에 read:packages 권한 없거나 SSO 미승인). 크리덴셜 'ghcr'을 수정하세요." >&2
+                  exit 90
+                fi
+
+                # 2xx가 아니고 403도 아니면 빈 목록으로 처리(신규 레포일 가능성)
+                if [ "${CODE:-0}" -lt 200 ] || [ "${CODE:-999}" -ge 300 ]; then
                   echo '{"tags":[]}' > tags.json
                 fi
               '''
             }
           }
         }
-        // yq로 JSON 파싱해 vN 중 최대값+1
         container('yq') {
           sh '''
             set -euo pipefail
@@ -207,14 +214,13 @@ spec:
                 { "auths": { "ghcr.io": { "auth": "$AUTH" } } }
                 EOF
 
-                echo "[buildctl] building ${IMAGE_NAME}:${IMAGE_TAG} (context=${CONTEXT_PATH})"
                 buildctl --addr "$BUILDKIT_ADDR" \
                   --tlscacert /tls/ca.crt --tlscert /tls/client.crt --tlskey /tls/client.key \
                   build --frontend=dockerfile.v0 --progress=plain \
                   --local context="src/app/${CONTEXT_PATH}" \
                   --local dockerfile="src/app/${CONTEXT_PATH}" \
                   --output type=image,name="${IMAGE_NAME}:${IMAGE_TAG}",push=true \
-                  --metadata-file "$WORKSPACE/.buildmeta.json"
+                  --metadata-file "$WORKSPACE/.buildmeta.json" || { echo "buildctl failed"; exit 4; }
 
                 ls -l "$WORKSPACE/.buildmeta.json" || true
               '''
@@ -226,7 +232,6 @@ spec:
 
     stage('Bump manifest tag') {
       steps {
-        // deploy_manifest clone
         container('git') {
           withCredentials([usernamePassword(
             credentialsId: 'GITHUB_PAT',
@@ -238,7 +243,7 @@ spec:
               rm -rf manifest && mkdir -p manifest
               cd manifest
               AUTH=$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\n')
-              git -c http.extraheader="AUTHORIZATION: Basic ${AUTH}" \
+              git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH}" \
                 clone --depth=1 https://github.com/DRSOL-HA/deploy_manifest.git repo
               cd repo
               git config user.name  "jenkins"
@@ -247,7 +252,6 @@ spec:
           }
         }
 
-        // kustomization images[].newTag 갱신
         container('yq') {
           withEnv(["SERVICE=${params.SERVICE}"]) {
             sh '''
@@ -268,7 +272,6 @@ spec:
           }
         }
 
-        // commit & push
         container('git') {
           withCredentials([usernamePassword(
             credentialsId: 'GITHUB_PAT',
@@ -284,8 +287,7 @@ spec:
                 git add -A
                 git commit -m "ci: bump board-${SERVICE} -> ${IMAGE_TAG}"
                 AUTH=$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\n')
-                git -c http.extraheader="AUTHORIZATION: Basic ${AUTH}" \
-                  push origin HEAD:main
+                git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH}" push origin HEAD:main
               fi
             '''
           }
