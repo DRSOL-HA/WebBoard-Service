@@ -23,25 +23,25 @@ spec:
     tty: true
     volumeMounts:
     - { name: tls, mountPath: /tls, readOnly: true }
-    - { name: work, mountPath: /home/jenkins/agent }
+    - { name: workspace-volume, mountPath: /home/jenkins/agent }
   - name: git
     image: alpine/git:2.45.2
     command: ["cat"]
     tty: true
     securityContext: { runAsUser: 0, runAsGroup: 0 }
     volumeMounts:
-    - { name: work, mountPath: /home/jenkins/agent }
+    - { name: workspace-volume, mountPath: /home/jenkins/agent }
   - name: yq
     image: ghcr.io/mikefarah/yq:4
     command: ["cat"]
     tty: true
     securityContext: { runAsUser: 0, runAsGroup: 0 }
     volumeMounts:
-    - { name: work, mountPath: /home/jenkins/agent }
+    - { name: workspace-volume, mountPath: /home/jenkins/agent }
   volumes:
   - name: tls
     secret: { secretName: buildkit-client-tls }
-  - name: work
+  - name: workspace-volume
     emptyDir: {}
 """
     }
