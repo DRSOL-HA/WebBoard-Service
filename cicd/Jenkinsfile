@@ -215,28 +215,33 @@ spec:
             usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_PAT')]) {
             withEnv(["SERVICE=${params.SERVICE}"]) {
               sh '''
-                set -euo pipefail
+                set -euxo pipefail
+    
                 CONTEXT_PATH="$(cat .build_context_path)"
                 IMAGE_NAME="${REGISTRY}/board-${SERVICE}"
-
+                META="$WORKSPACE/.buildmeta.json"
+    
                 export HOME="$WORKSPACE"
                 export DOCKER_CONFIG="$HOME/.docker"
                 mkdir -p "$DOCKER_CONFIG"
-
-                AUTH=$(printf '%s:%s' "$GHCR_USER" "$GHCR_PAT" | base64 | tr -d '\n')
+    
+                AUTH="$(printf '%s:%s' "$GHCR_USER" "$GHCR_PAT" | base64 | tr -d '\n')"
                 cat > "$DOCKER_CONFIG/config.json" <<EOF
                 { "auths": { "ghcr.io": { "auth": "$AUTH" } } }
                 EOF
-
+    
+                echo "[buildctl] building ${IMAGE_NAME}:${IMAGE_TAG} from ${CONTEXT_PATH}"
                 buildctl --addr "$BUILDKIT_ADDR" \
                   --tlscacert /tls/ca.crt --tlscert /tls/client.crt --tlskey /tls/client.key \
-                  build --frontend=dockerfile.v0 --progress=plain \
+                  build \
+                  --frontend=dockerfile.v0 \
                   --local context="src/app/${CONTEXT_PATH}" \
                   --local dockerfile="src/app/${CONTEXT_PATH}" \
                   --output type=image,name="${IMAGE_NAME}:${IMAGE_TAG}",push=true \
-                  --metadata-file "$WORKSPACE/.buildmeta.json" || { echo "buildctl failed"; exit 4; }
-
-                ls -l "$WORKSPACE/.buildmeta.json" || true
+                  --metadata-file "$META"
+    
+                # 푸시 성공 마커
+                touch .push_ok
               '''
             }
           }
