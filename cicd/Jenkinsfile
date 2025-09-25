@@ -25,24 +25,32 @@ spec:
     volumeMounts:
     - { name: tls, mountPath: /tls, readOnly: true }
     - { name: workspace-volume, mountPath: /home/jenkins/agent }
+
   - name: git
     image: alpine/git:2.45.2
     command: ["cat"]
     tty: true
     volumeMounts:
     - { name: workspace-volume, mountPath: /home/jenkins/agent }
+
   - name: yq
     image: ghcr.io/mikefarah/yq:4
     command: ["cat"]
     tty: true
     volumeMounts:
     - { name: workspace-volume, mountPath: /home/jenkins/agent }
+
+  # curl 전용 컨테이너: 쉘 보장 + root로 apk 설치 허용
   - name: curl
-    image: curlimages/curl:8.10.1
+    image: alpine:3.20
     command: ["cat"]
     tty: true
+    securityContext:
+      runAsUser: 0
+      runAsGroup: 0
     volumeMounts:
     - { name: workspace-volume, mountPath: /home/jenkins/agent }
+
   volumes:
   - name: tls
     secret:
@@ -68,7 +76,7 @@ spec:
 
   environment {
     REPO_HTTPS    = 'https://github.com/DRSOL-HA/WebBoard-Service.git'
-    REGISTRY      = 'ghcr.io/drsol-ha'  // OCI 규칙상 소문자 권장
+    REGISTRY      = 'ghcr.io/drsol-ha'         // OCI 권장 소문자
     BUILDKIT_ADDR = 'tcp://buildkitd.buildkit.svc.cluster.local:1234'
   }
 
@@ -79,7 +87,7 @@ spec:
         container('git') {
           withEnv(["BRANCH=${params.BRANCH}"]) {
             withCredentials([usernamePassword(
-              credentialsId: 'GITHUB_PAT',  // <-- 너희 Jenkins에 만든 GitHub PAT의 ID로 교체
+              credentialsId: 'GITHUB_PAT', // <-- Jenkins의 GitHub PAT ID
               usernameVariable: 'GH_USER',
               passwordVariable: 'GH_PAT'
             )]) {
@@ -128,13 +136,16 @@ spec:
     stage('Decide IMAGE_TAG (auto bump when empty)') {
       when { expression { return !(params.IMAGE_TAG?.trim()) } }
       steps {
-        // 1) GHCR 태그 목록을 curl로 가져와 파일 저장
+        // curl 준비 + GHCR 태그 조회
         container('curl') {
           withCredentials([usernamePassword(credentialsId: 'ghcr',
             usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_PAT')]) {
             withEnv(["SERVICE=${params.SERVICE}"]) {
               sh '''
-                set -euo pipefail
+                set -euxo pipefail
+                # curl 설치 (알파인 + root)
+                apk add --no-cache curl ca-certificates
+
                 OWNER="drsol-ha"
                 REPO="board-${SERVICE}"
                 if ! curl -fsS -H "Authorization: Bearer ${GHCR_PAT}" \
@@ -145,7 +156,7 @@ spec:
             }
           }
         }
-        // 2) yq로 JSON 파싱 → v숫자 패턴만 골라 최대값+1
+        // yq로 JSON 파싱해 vN 중 최대값+1
         container('yq') {
           sh '''
             set -euo pipefail
@@ -215,10 +226,10 @@ spec:
 
     stage('Bump manifest tag') {
       steps {
-        // deploy_manifest 클론(HTTPS+PAT)
+        // deploy_manifest clone
         container('git') {
           withCredentials([usernamePassword(
-            credentialsId: 'GITHUB_PAT',  // <-- deploy_manifest write 가능한 PAT
+            credentialsId: 'GITHUB_PAT',
             usernameVariable: 'GH_USER',
             passwordVariable: 'GH_PAT'
           )]) {
@@ -236,7 +247,7 @@ spec:
           }
         }
 
-        // kustomization.yaml의 images[].newTag 갱신
+        // kustomization images[].newTag 갱신
         container('yq') {
           withEnv(["SERVICE=${params.SERVICE}"]) {
             sh '''
@@ -257,7 +268,7 @@ spec:
           }
         }
 
-        // 커밋 & 푸시
+        // commit & push
         container('git') {
           withCredentials([usernamePassword(
             credentialsId: 'GITHUB_PAT',
