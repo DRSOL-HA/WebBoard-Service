@@ -13,7 +13,8 @@ pipeline {
 apiVersion: v1
 kind: Pod
 metadata:
-  labels: { jenkins: buildkit }
+  labels:
+    jenkins: buildkit
 spec:
   serviceAccountName: jenkins
   containers:
@@ -28,19 +29,24 @@ spec:
     image: alpine/git:2.45.2
     command: ["cat"]
     tty: true
-    securityContext: { runAsUser: 0, runAsGroup: 0 }
     volumeMounts:
     - { name: workspace-volume, mountPath: /home/jenkins/agent }
   - name: yq
     image: ghcr.io/mikefarah/yq:4
     command: ["cat"]
     tty: true
-    securityContext: { runAsUser: 0, runAsGroup: 0 }
+    volumeMounts:
+    - { name: workspace-volume, mountPath: /home/jenkins/agent }
+  - name: curl
+    image: curlimages/curl:8.10.1
+    command: ["cat"]
+    tty: true
     volumeMounts:
     - { name: workspace-volume, mountPath: /home/jenkins/agent }
   volumes:
   - name: tls
-    secret: { secretName: buildkit-client-tls }
+    secret:
+      secretName: buildkit-client-tls
   - name: workspace-volume
     emptyDir: {}
 """
@@ -54,30 +60,35 @@ spec:
 
   parameters {
     choice(name: 'SERVICE',
-      choices: 'user-service\nfile-service\npost-service\nfrontend\nnginx',
-      description: '빌드/배포할 서비스')
-    string(name: 'BRANCH', defaultValue: 'main', description: '서비스 코드 브랜치')
-    string(name: 'IMAGE_TAG', defaultValue: '', description: '비우면 자동(vN 증가)')
+           choices: 'user-service\nfile-service\npost-service\nfrontend',
+           description: '빌드/배포할 대상 서비스')
+    string(name: 'BRANCH', defaultValue: 'main', description: '빌드할 브랜치')
+    string(name: 'IMAGE_TAG', defaultValue: '', description: '비우면 서비스별 자동 증가(vN)')
   }
 
   environment {
-    REGISTRY      = 'ghcr.io/drsol-ha'   // OCI 규칙상 소문자 권장
+    REPO_HTTPS    = 'https://github.com/DRSOL-HA/WebBoard-Service.git'
+    REGISTRY      = 'ghcr.io/drsol-ha'  // OCI 규칙상 소문자 권장
     BUILDKIT_ADDR = 'tcp://buildkitd.buildkit.svc.cluster.local:1234'
   }
 
   stages {
+
     stage('Checkout service code') {
       steps {
         container('git') {
-          withEnv(["BRANCH=${params.BRANCH}", "REPO_URL=${REPOS[params.SERVICE]}"]) {
-            withCredentials([usernamePassword(credentialsId: 'GITHUB_PAT',
-              usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
+          withEnv(["BRANCH=${params.BRANCH}"]) {
+            withCredentials([usernamePassword(
+              credentialsId: 'GITHUB_PAT',  // <-- 너희 Jenkins에 만든 GitHub PAT의 ID로 교체
+              usernameVariable: 'GH_USER',
+              passwordVariable: 'GH_PAT'
+            )]) {
               sh '''
                 set -euxo pipefail
                 rm -rf src && mkdir -p src
-                git -c http.extraheader="AUTHORIZATION: Basic $(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\n')" \
-                  clone --depth=1 -b "$BRANCH" "$REPO_URL" src/app
-                cd src/app && git rev-parse --short=7 HEAD > ../../.short_sha
+                AUTH=$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\n')
+                git -c http.extraheader="AUTHORIZATION: Basic ${AUTH}" \
+                  clone --depth=1 -b "$BRANCH" "$REPO_HTTPS" src/app
               '''
             }
           }
@@ -105,7 +116,7 @@ spec:
                   FOUND="$c"; break
                 fi
               done
-              [ -n "$FOUND" ] || { echo "ERROR: Dockerfile 경로를 찾지 못함"; exit 2; }
+              [ -n "$FOUND" ] || { echo "ERROR: Dockerfile 경로 탐색 실패"; exit 2; }
               echo "Detected build context: $FOUND"
               echo "$FOUND" > .build_context_path
             '''
@@ -114,28 +125,53 @@ spec:
       }
     }
 
-    stage('Decide IMAGE_TAG (per-service auto bump when empty)') {
-      when { expression { return !params.IMAGE_TAG?.trim() } }
+    stage('Decide IMAGE_TAG (auto bump when empty)') {
+      when { expression { return !(params.IMAGE_TAG?.trim()) } }
       steps {
-        container('buildctl') {
+        // 1) GHCR 태그 목록을 curl로 가져와 파일 저장
+        container('curl') {
           withCredentials([usernamePassword(credentialsId: 'ghcr',
             usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_PAT')]) {
             withEnv(["SERVICE=${params.SERVICE}"]) {
               sh '''
-                set -euxo pipefail
-                apk add --no-cache curl jq >/dev/null
+                set -euo pipefail
                 OWNER="drsol-ha"
                 REPO="board-${SERVICE}"
-                TAGS_JSON="$(curl -fsS -H "Authorization: Bearer ${GHCR_PAT}" \
-                  "https://ghcr.io/v2/${OWNER}/${REPO}/tags/list?n=1000" || echo '{}')"
-                NEXT_TAG="$(printf '%s' "$TAGS_JSON" \
-                  | jq -r '[.tags[]? | select(test("^v[0-9]+$")) | ltrimstr("v") | tonumber] | (max // 0) + 1 | "v"+tostring')"
-                [ -n "$NEXT_TAG" ] || NEXT_TAG="v1"
-                echo "$NEXT_TAG" > .decided_tag
-                echo "Auto-decided IMAGE_TAG: $NEXT_TAG"
+                if ! curl -fsS -H "Authorization: Bearer ${GHCR_PAT}" \
+                  "https://ghcr.io/v2/${OWNER}/${REPO}/tags/list?n=1000" > tags.json; then
+                  echo '{"tags":[]}' > tags.json
+                fi
               '''
             }
           }
+        }
+        // 2) yq로 JSON 파싱 → v숫자 패턴만 골라 최대값+1
+        container('yq') {
+          sh '''
+            set -euo pipefail
+            NEXT_TAG=$(yq -r '
+              .tags // [] 
+              | map(select(test("^v[0-9]+$"))) 
+              | (map(sub("^v";"") | tonumber) | max // 0) + 1
+              | "v" + tostring
+            ' tags.json)
+            echo "$NEXT_TAG" > .image_tag
+            echo "Auto-decided IMAGE_TAG: $NEXT_TAG"
+          '''
+        }
+        script {
+          env.IMAGE_TAG = readFile('.image_tag').trim()
+          echo "Using IMAGE_TAG=${env.IMAGE_TAG}"
+        }
+      }
+    }
+
+    stage('Use provided IMAGE_TAG (if any)') {
+      when { expression { return (params.IMAGE_TAG?.trim()) } }
+      steps {
+        script {
+          env.IMAGE_TAG = params.IMAGE_TAG.trim()
+          echo "Using provided IMAGE_TAG=${env.IMAGE_TAG}"
         }
       }
     }
@@ -146,39 +182,30 @@ spec:
           withCredentials([usernamePassword(credentialsId: 'ghcr',
             usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_PAT')]) {
             withEnv(["SERVICE=${params.SERVICE}"]) {
-              script {
-                def tag = params.IMAGE_TAG?.trim()
-                if (!tag) { tag = readFile('.decided_tag').trim() }
-                env.EFFECTIVE_TAG = tag
-                echo "Using IMAGE_TAG=${env.EFFECTIVE_TAG}"
-              }
               sh '''
                 set -euo pipefail
                 CONTEXT_PATH="$(cat .build_context_path)"
                 IMAGE_NAME="${REGISTRY}/board-${SERVICE}"
-                META="$WORKSPACE/.buildmeta.json"
-                SHORT_SHA="$(cat .short_sha)"
 
                 export HOME="$WORKSPACE"
                 export DOCKER_CONFIG="$HOME/.docker"
                 mkdir -p "$DOCKER_CONFIG"
 
-                AUTH="$(printf '%s:%s' "$GHCR_USER" "$GHCR_PAT" | base64 | tr -d '\n')"
+                AUTH=$(printf '%s:%s' "$GHCR_USER" "$GHCR_PAT" | base64 | tr -d '\n')
                 cat > "$DOCKER_CONFIG/config.json" <<EOF
                 { "auths": { "ghcr.io": { "auth": "$AUTH" } } }
                 EOF
 
-                echo ">> buildctl push ${IMAGE_NAME}:${EFFECTIVE_TAG}"
+                echo "[buildctl] building ${IMAGE_NAME}:${IMAGE_TAG} (context=${CONTEXT_PATH})"
                 buildctl --addr "$BUILDKIT_ADDR" \
                   --tlscacert /tls/ca.crt --tlscert /tls/client.crt --tlskey /tls/client.key \
                   build --frontend=dockerfile.v0 --progress=plain \
                   --local context="src/app/${CONTEXT_PATH}" \
                   --local dockerfile="src/app/${CONTEXT_PATH}" \
-                  --opt filename="Dockerfile" \
-                  --output type=image,name="${IMAGE_NAME}:${EFFECTIVE_TAG}",push=true \
-                  --metadata-file "$META"
+                  --output type=image,name="${IMAGE_NAME}:${IMAGE_TAG}",push=true \
+                  --metadata-file "$WORKSPACE/.buildmeta.json"
 
-                [ -s "$META" ] || { echo "ERROR: metadata file missing"; exit 5; }
+                ls -l "$WORKSPACE/.buildmeta.json" || true
               '''
             }
           }
@@ -186,52 +213,21 @@ spec:
       }
     }
 
-    stage('Extract digest') {
+    stage('Bump manifest tag') {
       steps {
-        container('buildctl') {
-          withCredentials([usernamePassword(credentialsId: 'ghcr',
-            usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_PAT')]) {
-            withEnv(["SERVICE=${params.SERVICE}"]) {
-              sh '''
-                set -euo pipefail
-                apk add --no-cache curl jq >/dev/null || true
-                OWNER="drsol-ha"
-                REPO="board-${SERVICE}"
-                META="$WORKSPACE/.buildmeta.json"
-                OUT="$WORKSPACE/.image_digest"
-                DIGEST=""
-
-                # 1) 레지스트리에서 HEAD로 우선 확인 (정석)
-                HDR="$(curl -fsSI -H "Authorization: Bearer ${GHCR_PAT}" \
-                      -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
-                      "https://ghcr.io/v2/${OWNER}/${REPO}/manifests/${EFFECTIVE_TAG}")" || true
-                DIGEST="$(printf '%s\n' "$HDR" | awk -F': ' 'tolower($1)=="docker-content-digest" {gsub("\r","",$2); print $2}')"
-
-                # 2) 실패 시 메타파일 백업
-                if [ -z "$DIGEST" ] && [ -s "$META" ]; then
-                  DIGEST="$(jq -r '.. | objects | select(has("containerimage.descriptor")) | .["containerimage.descriptor"].digest // empty' "$META" | head -1)"
-                fi
-
-                [ -n "$DIGEST" ] || { echo "ERROR: failed to obtain digest (registry & meta both failed)"; exit 11; }
-                echo "$DIGEST" > "$OUT"
-                echo "Resolved digest: $DIGEST"
-              '''
-            }
-          }
-        }
-      }
-    }
-
-    stage('Bump manifest (pin by digest)') {
-      steps {
-        // deploy_manifest clone
+        // deploy_manifest 클론(HTTPS+PAT)
         container('git') {
-          withCredentials([usernamePassword(credentialsId: 'GITHUB_PAT',
-            usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
+          withCredentials([usernamePassword(
+            credentialsId: 'GITHUB_PAT',  // <-- deploy_manifest write 가능한 PAT
+            usernameVariable: 'GH_USER',
+            passwordVariable: 'GH_PAT'
+          )]) {
             sh '''
-              set -euxo pipefail
-              rm -rf manifest && mkdir -p manifest && cd manifest
-              git -c http.extraheader="AUTHORIZATION: Basic $(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\n')" \
+              set -euo pipefail
+              rm -rf manifest && mkdir -p manifest
+              cd manifest
+              AUTH=$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\n')
+              git -c http.extraheader="AUTHORIZATION: Basic ${AUTH}" \
                 clone --depth=1 https://github.com/DRSOL-HA/deploy_manifest.git repo
               cd repo
               git config user.name  "jenkins"
@@ -240,35 +236,34 @@ spec:
           }
         }
 
-        // yq로 digest 필드 세팅(+ newTag 제거)
+        // kustomization.yaml의 images[].newTag 갱신
         container('yq') {
           withEnv(["SERVICE=${params.SERVICE}"]) {
             sh '''
-              set -euxo pipefail
+              set -euo pipefail
               cd manifest/repo
               FILE="apps/board/kustomization.yaml"
-              [ -f "$FILE" ] || { echo "ERROR: $FILE not found"; exit 3; }
+              [ -f "$FILE" ] || { echo "kustomization not found: $FILE"; exit 3; }
 
               export IMG_LOWER="ghcr.io/drsol-ha/board-${SERVICE}"
               export IMG_UPPER="ghcr.io/DRSOL-HA/board-${SERVICE}"
-              export DIGEST="$(cat "$WORKSPACE/.image_digest")"
+              export NEW_TAG="${IMAGE_TAG}"
 
               yq -i '
-                .images |= map(
-                  if (.name == strenv(IMG_LOWER)) or (.name == strenv(IMG_UPPER))
-                  then del(.newTag) | .digest = strenv(DIGEST)
-                  else .
-                  end
-                )
+                (.images[] | select((.name == strenv(IMG_LOWER)) or (.name == strenv(IMG_UPPER))).newTag)
+                = strenv(NEW_TAG)
               ' "$FILE"
             '''
           }
         }
 
-        // commit & push
+        // 커밋 & 푸시
         container('git') {
-          withCredentials([usernamePassword(credentialsId: 'GITHUB_PAT',
-            usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
+          withCredentials([usernamePassword(
+            credentialsId: 'GITHUB_PAT',
+            usernameVariable: 'GH_USER',
+            passwordVariable: 'GH_PAT'
+          )]) {
             sh '''
               set -euo pipefail
               cd manifest/repo
@@ -276,8 +271,9 @@ spec:
                 echo "No manifest changes to commit."
               else
                 git add -A
-                git commit -m "ci: pin board-${SERVICE} to $(cat "$WORKSPACE/.image_digest") (${EFFECTIVE_TAG})"
-                git -c http.extraheader="AUTHORIZATION: Basic $(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\n')" \
+                git commit -m "ci: bump board-${SERVICE} -> ${IMAGE_TAG}"
+                AUTH=$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\n')
+                git -c http.extraheader="AUTHORIZATION: Basic ${AUTH}" \
                   push origin HEAD:main
               fi
             '''
