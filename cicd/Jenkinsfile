@@ -225,12 +225,15 @@ spec:
                 export DOCKER_CONFIG="$HOME/.docker"
                 mkdir -p "$DOCKER_CONFIG"
     
+                # GHCR 로그인 구성
                 AUTH="$(printf '%s:%s' "$GHCR_USER" "$GHCR_PAT" | base64 | tr -d '\n')"
                 cat > "$DOCKER_CONFIG/config.json" <<EOF
                 { "auths": { "ghcr.io": { "auth": "$AUTH" } } }
                 EOF
     
                 echo "[buildctl] building ${IMAGE_NAME}:${IMAGE_TAG} from ${CONTEXT_PATH}"
+    
+                # 실제 빌드 + 푸시 (+ 메타데이터 파일 저장)
                 buildctl --addr "$BUILDKIT_ADDR" \
                   --tlscacert /tls/ca.crt --tlscert /tls/client.crt --tlskey /tls/client.key \
                   build \
