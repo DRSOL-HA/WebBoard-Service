@@ -92,7 +92,7 @@ def create_post():
         file_name = data.get('file_name')
         
         if not title or not content:
-            return jsonify({'error': '제목과 내용을 입력해주세요'}), 400
+            return jsonify({'error': '제목과 내용을 입력해주세요.'}), 400
         
         # 파일 첨부는 선택 사항
         if not file_id:
