@@ -11,7 +11,7 @@ app = Flask(__name__)
 app.config.from_object(Config)
 
 # S3 클라이언트 초기화
-def get_s3_client():
+def get_s3_client():  
     try:
         if app.config['S3_ENDPOINT_URL']:
             # MinIO 등 다른 S3 호환 서비스 사용
