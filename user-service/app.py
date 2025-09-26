@@ -51,7 +51,7 @@ def login():
                 'username': user.username
             }), 200
         else:
-            return jsonify({'error': '아이디 또는 비밀번호가 잘못되었습니다'}), 401
+            return jsonify({'error': '아이디 또는 비밀번호가 잘못되었습니다~~'}), 401
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
