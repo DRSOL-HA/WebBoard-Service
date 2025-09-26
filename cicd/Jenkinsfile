@@ -9,7 +9,6 @@ def REPOS = [
 pipeline {
   agent {
     kubernetes {
-      // 기본 컨테이너는 jnlp (아무 일 안 함). 실제 작업은 각 container 블록에서 수행
       yaml """
 apiVersion: v1
 kind: Pod
@@ -35,27 +34,21 @@ spec:
         - { name: workspace-volume, mountPath: /home/jenkins/agent }
     - name: git
       image: alpine/git:2.45.2
-      securityContext:
-        runAsUser: 0
-        runAsGroup: 0
+      securityContext: { runAsUser: 0, runAsGroup: 0 }
       command: ["cat"]
       tty: true
       volumeMounts:
         - { name: workspace-volume, mountPath: /home/jenkins/agent }
     - name: yq
       image: ghcr.io/mikefarah/yq:4
-      securityContext:
-        runAsUser: 0
-        runAsGroup: 0
+      securityContext: { runAsUser: 0, runAsGroup: 0 }
       command: ["cat"]
       tty: true
       volumeMounts:
         - { name: workspace-volume, mountPath: /home/jenkins/agent }
     - name: utils
       image: alpine:3.20
-      securityContext:
-        runAsUser: 0
-        runAsGroup: 0
+      securityContext: { runAsUser: 0, runAsGroup: 0 }
       command: ["cat"]
       tty: true
       volumeMounts:
@@ -71,36 +64,30 @@ spec:
       description: '빌드할 서비스(디렉터리) 선택'
     )
     string(name: 'IMAGE_TAG', defaultValue: '', description: '지정하면 해당 태그로 푸시, 비우면 vN 자동 증가')
-    // ✅ 실제 Jenkins 크리덴셜 ID로 기본값 맞춤
-    string(name: 'GIT_CRED_ID',   defaultValue: 'GITHUB_PAT', description: 'GitHub(소스/manifest) PAT 크리덴셜 ID')
-    string(name: 'GHCR_CRED_ID',  defaultValue: 'ghcr',       description: 'GHCR(이미지 푸시) PAT 크리덴셜 ID')
+    string(name: 'GIT_CRED_ID',   defaultValue: 'GITHUB_PAT',  description: 'GitHub(소스/manifest) PAT 크리덴셜 ID')
+    string(name: 'GHCR_CRED_ID',  defaultValue: 'ghcr-owner',  description: 'GHCR(이미지 푸시) PAT 크리덴셜 ID')
   }
 
   options {
-    // 문제가 되었던 timestamps(), ansiColor()는 옵션이 아님 — 제거
     disableResume()
     durabilityHint('PERFORMANCE_OPTIMIZED')
-    skipDefaultCheckout(true) // Declarative 자동 체크아웃 생략
+    skipDefaultCheckout(true)
   }
 
   environment {
     REGISTRY = 'ghcr.io'
-    ORG      = 'drsol-ha' // GHCR 오너(조직) — 소문자 권장
+    ORG      = 'drsol-ha'  // GHCR 조직/오너 (소문자 권장)
   }
 
   stages {
 
     stage('Checkout Jenkinsfile repo (self)') {
-      steps {
-        // Jenkinsfile 저장소만 가볍게 체크아웃 (추가 소스는 다음 stage에서 별도로 clone)
-        checkout scm
-      }
+      steps { checkout scm }
     }
 
     stage('Init env (mapping)') {
       steps {
         script {
-          // 서비스 -> 이미지 리포 이름 매핑
           def imageMap = [
             'user-service': 'board-user-service',
             'file-service': 'board-file-service',
@@ -113,15 +100,7 @@ spec:
           }
           env.IMAGE_REPO = imageMap[params.SERVICE]
 
-          // 모든 서비스가 동일 저장소를 쓰는 현재 구조
-          def repoMap = [
-            'user-service': 'https://github.com/DRSOL-HA/WebBoard-Service.git',
-            'file-service': 'https://github.com/DRSOL-HA/WebBoard-Service.git',
-            'post-service': 'https://github.com/DRSOL-HA/WebBoard-Service.git',
-            'frontend'    : 'https://github.com/DRSOL-HA/WebBoard-Service.git',
-            'nginx'       : 'https://github.com/DRSOL-HA/WebBoard-Service.git',
-          ]
-          env.SRC_REPO = repoMap[params.SERVICE]
+          env.SRC_REPO = REPOS[params.SERVICE]
         }
       }
     }
@@ -144,7 +123,7 @@ spec:
 
     stage('Resolve build context') {
       steps {
-        container('yq') {
+        container('yq') { // yq 컨테이너지만 쉘만 사용
           sh '''
             set -eu
             HINT="$(printf '%s' "${SERVICE}" | sed 's/-service$//')"
@@ -177,25 +156,22 @@ spec:
               set -eu
               apk add --no-cache curl jq ca-certificates >/dev/null
               REPO="${IMAGE_REPO}"
-
-              # Bearer 토큰(PUSH 스코프) 취득
               TOKEN="$(curl -sS -u "${GHCR_USR}:${GHCR_PSW}" \
                 "https://ghcr.io/token?service=ghcr.io&scope=repository:${ORG}/${REPO}:pull,push" | jq -r .token)"
 
               if [ -z "${TOKEN}" ] || [ "${TOKEN}" = "null" ]; then
-                echo "ERROR: GHCR 토큰을 받지 못했습니다. (크리덴셜/SSO/권한 확인)" >&2
+                echo "ERROR: GHCR 토큰 발급 실패 (크리덴셜/SSO/권한 확인)." >&2
                 exit 90
               fi
 
-              # 업로드 세션(빈 업로드) 열어 보기 — 202(혹은 201)이면 OK
               CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
                 -H "Authorization: Bearer ${TOKEN}" \
                 -X POST "https://ghcr.io/v2/${ORG}/${REPO}/blobs/uploads/")"
 
               case "${CODE}" in
                 201|202) echo "GHCR push check OK (${CODE})" ;;
-                401|403) echo "ERROR: GHCR 권한 거부(${CODE}). PAT에 write:packages 및 Org SSO 승인 필요." >&2; exit 91 ;;
-                404)     echo "ERROR: Package(${ORG}/${REPO})가 존재하지 않습니다. 최초 생성 권한/설정 확인." >&2; exit 92 ;;
+                401|403) echo "ERROR: GHCR 권한 거부(${CODE}). PAT write:packages + Org 정책/SSO 확인 필요." >&2; exit 91 ;;
+                404)     echo "ERROR: Package(${ORG}/${REPO}) 미존재. 최초 생성 권한/정책 확인." >&2; exit 92 ;;
                 *)       echo "ERROR: GHCR 업로드 세션 실패 (HTTP ${CODE})." >&2; exit 93 ;;
               esac
 
@@ -279,18 +255,27 @@ spec:
     stage('Bump manifest tag') {
       when { expression { return fileExists('.image_tag') && fileExists('.push_ok') } }
       steps {
-        container('git') {
-          withCredentials([usernamePassword(credentialsId: params.GIT_CRED_ID, usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
+        withCredentials([usernamePassword(credentialsId: params.GIT_CRED_ID, usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
+
+          // 1) clone
+          container('git') {
             sh '''
               set -eu
               rm -rf manifest && mkdir -p manifest && cd manifest
               AUTH="$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\\n')"
               git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH}" \
                   clone --depth=1 https://github.com/DRSOL-HA/deploy_manifest.git repo
+            '''
+          }
 
-              cd repo
+          // 2) edit with yq
+          container('yq') {
+            sh '''
+              set -eu
+              cd manifest/repo
+
               IMAGE_LOWER="ghcr.io/${ORG}/${IMAGE_REPO}"
-              IMAGE_UPPER="ghcr.io/${ORG.toUpperCase()}/${IMAGE_REPO}"
+              IMAGE_UPPER="ghcr.io/${ORG^^}/${IMAGE_REPO}"   # bash zsh 호환 위해 ^^ 대신 env 대체 불가 시 Groovy서치 사용 가능
 
               FILE="apps/board/kustomization.yaml"
               test -f "${FILE}"
@@ -299,16 +284,22 @@ spec:
               export IMG_LOWER="${IMAGE_LOWER}"
               export IMG_UPPER="${IMAGE_UPPER}"
 
-              # yq v4: JSON/YAML 모두 처리 가능
               yq -i '
                 (.images[] | select((.name == strenv(IMG_LOWER)) or (.name == strenv(IMG_UPPER))).newTag)
                 = strenv(NEW_TAG)
               ' "${FILE}"
+            '''
+          }
 
+          // 3) commit & push
+          container('git') {
+            sh '''
+              set -eu
+              cd manifest/repo
               git config user.name  "jenkins"
               git config user.email "ci@drsol-ha.local"
               git add -A
-              git commit -m "ci: bump ${IMAGE_REPO} -> ${NEW_TAG}" || true
+              git commit -m "ci: bump ${IMAGE_REPO} -> $(cat "$WORKSPACE/.image_tag")" || true
 
               AUTH_PUSH="$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\\n')"
               git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH_PUSH}" push origin HEAD:main
