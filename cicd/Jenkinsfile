@@ -105,14 +105,20 @@ spec:
             set -eu
             cd src/app
     
-            # HEAD~1이 있으면 두 커밋 비교, 없으면 HEAD 커밋의 변경 파일만
+            # 1) 가장 안전한 방식: 마지막 커밋(HEAD)의 변경 파일만 읽기
+            CHANGED="$(git show --name-only --pretty='' HEAD || true)"
+    
+            # 혹시라도 HEAD~1 이 있는 경우엔 두 커밋 비교도 시도(선택)
             if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
-              CHANGED="$(git diff --name-only HEAD~1 HEAD || true)"
-            else
-              CHANGED="$(git show --name-only --pretty='' HEAD || true)"
+              CHANGED2="$(git diff --name-only HEAD~1 HEAD || true)"
+              # 둘 중 더 긴 쪽 사용(빈값 방지)
+              [ ${#CHANGED2} -gt ${#CHANGED} ] && CHANGED="$CHANGED2" || true
             fi
     
             cd - >/dev/null
+    
+            echo "변경 파일:"
+            printf '%s\n' "$CHANGED"
     
             SERVICES=""
             for s in user-service file-service post-service frontend nginx; do
@@ -121,14 +127,12 @@ spec:
               fi
             done
     
-            # 비어있으면 아무 것도 빌드하지 않음
+            # 비어있으면 아무 것도 빌드하지 않음(기본값 없음)
             SERVICES="$(printf '%b' "$SERVICES" | sed '/^$/d' || true)"
             printf '%s\n' "$SERVICES" > .services
     
-            echo "변경 파일:"
-            printf '%s\n' "$CHANGED"
             echo "빌드 대상:"
-            cat .services
+            cat .services || true
           '''
         }
       }
