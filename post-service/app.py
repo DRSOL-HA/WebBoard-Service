@@ -122,7 +122,7 @@ def delete_post(post_id):
         user_info = verify_user_token(token)
         
         if not user_info:
-            return jsonify({'error': '인증이 필요합니다'}), 401
+            return jsonify({'error': '인증이 필요합니다..'}), 401
         
         post = Post.query.get_or_404(post_id)
         
