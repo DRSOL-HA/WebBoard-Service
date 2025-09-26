@@ -256,51 +256,70 @@ spec:
       }
     }
 
-    stage('Bump manifest (single commit)') {
-      when { expression { return fileExists('.push_ok') && fileExists('.tags') } }
-      steps {
-        container('git') {
-          withCredentials([usernamePassword(credentialsId: params.GIT_CRED_ID, usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
-            sh '''
-              set -eu
-              rm -rf manifest && mkdir -p manifest && cd manifest
-              AUTH="$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\\n')"
-              git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH}" \
-                  clone --depth=1 https://github.com/DRSOL-HA/deploy_manifest.git repo
-              cd repo
-              FILE="apps/board/kustomization.yaml"
-              test -f "${FILE}"
+stage('Bump manifest (single commit)') {
+  when { expression { return fileExists('.push_ok') && fileExists('.tags') } }
+  steps {
+    // 1) clone (git 컨테이너)
+    container('git') {
+      withCredentials([usernamePassword(credentialsId: params.GIT_CRED_ID, usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
+        sh '''
+          set -eu
+          rm -rf manifest && mkdir -p manifest && cd manifest
+          AUTH="$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\\n')"
+          git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH}" \
+              clone --depth=1 https://github.com/DRSOL-HA/deploy_manifest.git repo
+        '''
+      }
+    }
 
-              while IFS=':' read -r SVC TAG; do
-                [ -n "$SVC" ] || continue
-                case "$SVC" in
-                  user-service) IMG="ghcr.io/${ORG}/board-user-service" ;;
-                  file-service) IMG="ghcr.io/${ORG}/board-file-service" ;;
-                  post-service) IMG="ghcr.io/${ORG}/board-post-service" ;;
-                  frontend)     IMG="ghcr.io/${ORG}/board-frontend" ;;
-                  nginx)        IMG="ghcr.io/${ORG}/board-nginx" ;;
-                esac
-                IMAGE_NAME_CANON="$IMG"
-                NEW_TAG="$TAG"
-                yq -i '
-                  (.images[] | select((.name | downcase) == (strenv(IMAGE_NAME_CANON) | downcase))).newTag
-                  = strenv(NEW_TAG)
-                ' "${FILE}"
-              done < "$WORKSPACE/.tags"
+    // 2) yq로 태그 수정 (yq 컨테이너)
+    container('yq') {
+      sh '''
+        set -eu
+        cd manifest/repo
+        FILE="apps/board/kustomization.yaml"
+        test -f "${FILE}"
 
-              git config user.name  "jenkins"
-              git config user.email "ci@drsol-ha.local"
-              git add -A
-              MSG="ci: bump $(tr '\\n' ' ' < "$WORKSPACE/.tags")"
-              git commit -m "${MSG}" || true
-              AUTH_PUSH="$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\\n')"
-              git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH_PUSH}" push origin HEAD:main
-            '''
-          }
-        }
+        # .tags: "service:tag" 형식
+        while IFS=':' read -r SVC TAG; do
+          [ -n "$SVC" ] || continue
+          case "$SVC" in
+            user-service) IMG="ghcr.io/${ORG}/board-user-service" ;;
+            file-service) IMG="ghcr.io/${ORG}/board-file-service" ;;
+            post-service) IMG="ghcr.io/${ORG}/board-post-service" ;;
+            frontend)     IMG="ghcr.io/${ORG}/board-frontend" ;;
+            nginx)        IMG="ghcr.io/${ORG}/board-nginx" ;;
+            *) echo "unknown service: $SVC" >&2; exit 2 ;;
+          esac
+          IMAGE_NAME_CANON="$IMG"
+          NEW_TAG="$TAG"
+          yq -i '
+            (.images[] | select((.name | downcase) == (strenv(IMAGE_NAME_CANON) | downcase))).newTag
+            = strenv(NEW_TAG)
+          ' "${FILE}"
+        done < "$WORKSPACE/.tags"
+      '''
+    }
+
+    // 3) commit & push (git 컨테이너)
+    container('git') {
+      withCredentials([usernamePassword(credentialsId: params.GIT_CRED_ID, usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
+        sh '''
+          set -eu
+          cd manifest/repo
+          git config user.name  "jenkins"
+          git config user.email "ci@drsol-ha.local"
+          git add -A
+          MSG="ci: bump $(tr '\\n' ' ' < "$WORKSPACE/.tags")"
+          git commit -m "${MSG}" || true
+
+          AUTH_PUSH="$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\\n')"
+          git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH_PUSH}" push origin HEAD:main
+        '''
       }
     }
   }
+}
 
   post {
     always {
