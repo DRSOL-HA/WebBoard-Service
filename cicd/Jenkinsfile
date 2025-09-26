@@ -58,12 +58,18 @@ spec:
     }
   }
 
+  // Jenkins Job 트리거(웹훅 + 폴링 백업)
+  triggers {
+    githubPush()
+    pollSCM('H/5 * * * *') // 웹훅 장애 대비 백업
+  }
+
   parameters {
-    // 선택적으로 모든 서비스에 동일 태그를 강제하고 싶으면 IMAGE_TAG 지정
-    string(name: 'IMAGE_TAG', defaultValue: '', description: '모든 서비스에 공통 적용할 태그 (비우면 서비스별 vN 자동 증가)')
+    // 비우면 서비스별 vN 자동 증가, 채우면 모든 서비스에 동일 태그 적용
+    string(name: 'IMAGE_TAG',  defaultValue: '',            description: '모든 서비스 공통 태그(비우면 vN 자동증가)')
     // Jenkins Credentials ID
-    string(name: 'GIT_CRED_ID',  defaultValue: 'GITHUB_PAT',  description: 'GitHub(소스/manifest) PAT 크리덴셜 ID')
-    string(name: 'GHCR_CRED_ID', defaultValue: 'ghcr-owner',  description: 'GHCR(이미지 푸시) PAT 크리덴셜 ID')
+    string(name: 'GIT_CRED_ID',  defaultValue: 'GITHUB_PAT', description: 'GitHub(소스/manifest) PAT 크리덴셜 ID')
+    string(name: 'GHCR_CRED_ID', defaultValue: 'ghcr-owner', description: 'GHCR(이미지 푸시) PAT 크리덴셜 ID')
   }
 
   options {
@@ -74,7 +80,7 @@ spec:
 
   environment {
     REGISTRY = 'ghcr.io'
-    ORG      = 'drsol-ha'  // 소문자 권장
+    ORG      = 'drsol-ha'   // 소문자
   }
 
   stages {
@@ -97,42 +103,50 @@ spec:
       }
     }
 
-    // 2) 변경된 서비스 감지 (최근 커밋 기준). 없으면 user-service만 빌드
+    // 2) 변경된 서비스 감지 (가장 안전한 방식)
     stage('Detect services to build') {
       steps {
         container('git') {
           sh '''
             set -eu
             cd src/app
-            # 최근 커밋 기준 변경 파일 목록(깃훅 트리거 시 depth=2 이므로 HEAD~1..HEAD 가능)
-            CHANGED="$(git diff --name-only HEAD~1..HEAD || true)"
+
+            # A. HEAD에서 변경된 파일(웹훅/단건커밋 보장)
+            CHANGED="$(git show --name-only --pretty='' HEAD || true)"
+
+            # B. 혹시 depth=2이고 이전 커밋도 비교 가능하면 보조 비교
+            if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+              CHANGED2="$(git diff --name-only HEAD~1 HEAD || true)"
+              [ ${#CHANGED2} -gt ${#CHANGED} ] && CHANGED="$CHANGED2" || true
+            fi
             cd - >/dev/null
-    
+
+            echo "변경 파일:"
+            printf '%s\n' "$CHANGED"
+
             SERVICES=""
-    
             for s in user-service file-service post-service frontend nginx; do
               if printf '%s\n' "$CHANGED" | grep -E "^${s}(/|$)" >/dev/null 2>&1; then
                 SERVICES="${SERVICES}\\n${s}"
               fi
             done
-    
-            # 변경 없으면 기본으로 user-service만
-            if [ -z "${SERVICES#\\n}" ]; then
-              SERVICES="user-service"
-            else
-              SERVICES="$(printf '%b' "$SERVICES" | sed '/^$/d')"
-            fi
-    
+
+            # 비어있으면 아무 것도 빌드하지 않음
+            SERVICES="$(printf '%b' "$SERVICES" | sed '/^$/d' || true)"
             printf '%s\n' "$SERVICES" > .services
+
             echo "빌드 대상:"
-            cat .services
+            cat .services || true
           '''
         }
       }
     }
-    
+
     // 3) (서비스별) GHCR 푸시 권한 확인
     stage('Sanity: GHCR push permission (each)') {
+      when {
+        expression { fileExists('.services') && readFile('.services').trim().length() > 0 }
+      }
       steps {
         container('utils') {
           withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'GHCR_USR', passwordVariable: 'GHCR_PSW')]) {
@@ -177,7 +191,9 @@ spec:
 
     // 4) (서비스별) 태그 결정
     stage('Decide tags (each)') {
-      when { expression { return (params.IMAGE_TAG?.trim() == '') } }
+      when {
+        expression { fileExists('.services') && readFile('.services').trim().length() > 0 }
+      }
       steps {
         container('utils') {
           withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'GHCR_USR', passwordVariable: 'GHCR_PSW')]) {
@@ -196,6 +212,9 @@ spec:
                   nginx)        REPO="board-nginx" ;;
                 esac
 
+                # 공통 태그가 파라미터로 지정된 경우 스킵(다음 stage에서 일괄 적용)
+                [ -n "${IMAGE_TAG:-}" ] && continue
+
                 TOKEN="$(curl -sS -u "${GHCR_USR}:${GHCR_PSW}" \
                   "https://ghcr.io/token?service=ghcr.io&scope=repository:${ORG}/${REPO}:pull" | jq -r .token)"
 
@@ -206,8 +225,7 @@ spec:
                 echo "${SVC}:${NEXT}" >> .tags
               done < .services
 
-              echo "태그 결정:"
-              cat .tags
+              [ -s .tags ] && { echo "태그 결정:"; cat .tags; } || true
             '''
           }
         }
@@ -216,7 +234,9 @@ spec:
 
     // 5) 공통 태그 강제 (선택)
     stage('Use provided IMAGE_TAG for all (optional)') {
-      when { expression { return (params.IMAGE_TAG?.trim() != '') } }
+      when {
+        expression { fileExists('.services') && readFile('.services').trim().length() > 0 && params.IMAGE_TAG?.trim() }
+      }
       steps {
         sh '''
           set -eu
@@ -233,6 +253,9 @@ spec:
 
     // 6) 빌드 & 푸시 (서비스별)
     stage('Build & Push (each)') {
+      when {
+        expression { fileExists('.tags') && readFile('.tags').trim().length() > 0 }
+      }
       steps {
         container('buildctl') {
           withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'GHCR_USR', passwordVariable: 'GHCR_PSW')]) {
@@ -280,7 +303,9 @@ spec:
 
     // 7) 매니페스트 버전 범프 (단일 커밋)
     stage('Bump manifest (single commit)') {
-      when { expression { return fileExists('.push_ok') && fileExists('.tags') } }
+      when {
+        expression { fileExists('.tags') && readFile('.tags').trim().length() > 0 }
+      }
       steps {
         // 7-1 clone (git 컨테이너)
         container('git') {
