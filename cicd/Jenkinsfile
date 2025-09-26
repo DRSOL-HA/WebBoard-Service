@@ -58,6 +58,16 @@ spec:
     }
   }
 
+  triggers {
+    githubPush()
+    pollSCM('H/2 * * * *')   // 임시 폴백
+  }
+
+  options {
+    // 잡과 GitHub 리포 URL을 연결 (웹훅 매칭에 도움)
+    githubProjectProperty(urlStr: 'https://github.com/DRSOL-HA/WebBoard-Service')
+  }
+
   parameters {
     // 선택적으로 모든 서비스에 동일 태그를 강제하고 싶으면 IMAGE_TAG 지정
     string(name: 'IMAGE_TAG', defaultValue: '', description: '모든 서비스에 공통 적용할 태그 (비우면 서비스별 vN 자동 증가)')
