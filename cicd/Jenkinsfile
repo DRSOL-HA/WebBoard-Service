@@ -104,8 +104,14 @@ spec:
           sh '''
             set -eu
             cd src/app
-            # 최근 커밋 기준 변경 파일
-            CHANGED="$(git diff --name-only HEAD~1..HEAD || true)"
+    
+            # HEAD~1이 있으면 두 커밋 비교, 없으면 HEAD 커밋의 변경 파일만
+            if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+              CHANGED="$(git diff --name-only HEAD~1 HEAD || true)"
+            else
+              CHANGED="$(git show --name-only --pretty='' HEAD || true)"
+            fi
+    
             cd - >/dev/null
     
             SERVICES=""
@@ -115,15 +121,14 @@ spec:
               fi
             done
     
-            SERVICES="$(printf '%b' "$SERVICES" | sed '/^$/d' | sort -u)"
+            # 비어있으면 아무 것도 빌드하지 않음
+            SERVICES="$(printf '%b' "$SERVICES" | sed '/^$/d' || true)"
             printf '%s\n' "$SERVICES" > .services
     
-            if [ ! -s .services ]; then
-              echo "No service changes detected. Skipping subsequent stages."
-            else
-              echo "빌드 대상:"
-              cat .services
-            fi
+            echo "변경 파일:"
+            printf '%s\n' "$CHANGED"
+            echo "빌드 대상:"
+            cat .services
           '''
         }
       }
