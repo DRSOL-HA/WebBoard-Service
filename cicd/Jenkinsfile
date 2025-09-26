@@ -58,16 +58,6 @@ spec:
     }
   }
 
-  triggers {
-    githubPush()
-    pollSCM('H/2 * * * *')   // 임시 폴백
-  }
-
-  options {
-    // 잡과 GitHub 리포 URL을 연결 (웹훅 매칭에 도움)
-    githubProjectProperty(urlStr: 'https://github.com/DRSOL-HA/WebBoard-Service')
-  }
-
   parameters {
     // 선택적으로 모든 서비스에 동일 태그를 강제하고 싶으면 IMAGE_TAG 지정
     string(name: 'IMAGE_TAG', defaultValue: '', description: '모든 서비스에 공통 적용할 태그 (비우면 서비스별 vN 자동 증가)')
@@ -107,51 +97,42 @@ spec:
       }
     }
 
-    // 2) 변경된 서비스 감지 (최근 커밋 기준).
+    // 2) 변경된 서비스 감지 (최근 커밋 기준). 없으면 user-service만 빌드
     stage('Detect services to build') {
       steps {
         container('git') {
           sh '''
             set -eu
             cd src/app
-    
-            # 1) 가장 안전한 방식: 마지막 커밋(HEAD)의 변경 파일만 읽기
-            CHANGED="$(git show --name-only --pretty='' HEAD || true)"
-    
-            # 혹시라도 HEAD~1 이 있는 경우엔 두 커밋 비교도 시도(선택)
-            if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
-              CHANGED2="$(git diff --name-only HEAD~1 HEAD || true)"
-              # 둘 중 더 긴 쪽 사용(빈값 방지)
-              [ ${#CHANGED2} -gt ${#CHANGED} ] && CHANGED="$CHANGED2" || true
-            fi
-    
+            # 최근 커밋 기준 변경 파일 목록(깃훅 트리거 시 depth=2 이므로 HEAD~1..HEAD 가능)
+            CHANGED="$(git diff --name-only HEAD~1..HEAD || true)"
             cd - >/dev/null
     
-            echo "변경 파일:"
-            printf '%s\n' "$CHANGED"
-    
             SERVICES=""
+    
             for s in user-service file-service post-service frontend nginx; do
               if printf '%s\n' "$CHANGED" | grep -E "^${s}(/|$)" >/dev/null 2>&1; then
                 SERVICES="${SERVICES}\\n${s}"
               fi
             done
     
-            # 비어있으면 아무 것도 빌드하지 않음(기본값 없음)
-            SERVICES="$(printf '%b' "$SERVICES" | sed '/^$/d' || true)"
-            printf '%s\n' "$SERVICES" > .services
+            # 변경 없으면 기본으로 user-service만
+            if [ -z "${SERVICES#\\n}" ]; then
+              SERVICES="user-service"
+            else
+              SERVICES="$(printf '%b' "$SERVICES" | sed '/^$/d')"
+            fi
     
+            printf '%s\n' "$SERVICES" > .services
             echo "빌드 대상:"
-            cat .services || true
+            cat .services
           '''
         }
       }
     }
+    
     // 3) (서비스별) GHCR 푸시 권한 확인
     stage('Sanity: GHCR push permission (each)') {
-      when {
-        expression { fileExists('.services') && readFile('.services').trim().length() > 0 }
-      }
       steps {
         container('utils') {
           withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'GHCR_USR', passwordVariable: 'GHCR_PSW')]) {
@@ -196,9 +177,7 @@ spec:
 
     // 4) (서비스별) 태그 결정
     stage('Decide tags (each)') {
-      when {
-        expression { fileExists('.services') && readFile('.services').trim().length() > 0 }
-      }
+      when { expression { return (params.IMAGE_TAG?.trim() == '') } }
       steps {
         container('utils') {
           withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'GHCR_USR', passwordVariable: 'GHCR_PSW')]) {
@@ -254,9 +233,6 @@ spec:
 
     // 6) 빌드 & 푸시 (서비스별)
     stage('Build & Push (each)') {
-      when {
-        expression { fileExists('.services') && readFile('.services').trim().length() > 0 }
-      }
       steps {
         container('buildctl') {
           withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'GHCR_USR', passwordVariable: 'GHCR_PSW')]) {
@@ -304,9 +280,7 @@ spec:
 
     // 7) 매니페스트 버전 범프 (단일 커밋)
     stage('Bump manifest (single commit)') {
-      when {
-        expression { fileExists('.services') && readFile('.services').trim().length() > 0 }
-      }
+      when { expression { return fileExists('.push_ok') && fileExists('.tags') } }
       steps {
         // 7-1 clone (git 컨테이너)
         container('git') {
