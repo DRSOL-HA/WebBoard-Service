@@ -10,7 +10,7 @@ from io import BytesIO
 app = Flask(__name__)
 app.config.from_object(Config)
 
-# S3 클라이언트 초기화
+# S3 클라이언트 초기화 
 def get_s3_client():  
     try:
         if app.config['S3_ENDPOINT_URL']:
