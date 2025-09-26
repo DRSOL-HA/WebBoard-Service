@@ -9,107 +9,133 @@ def REPOS = [
 pipeline {
   agent {
     kubernetes {
-      label "app-pod"
-      defaultContainer 'jnlp'
+      // 기본 컨테이너는 jnlp (아무 일 안 함). 실제 작업은 각 container 블록에서 수행
       yaml """
 apiVersion: v1
 kind: Pod
 metadata:
   labels:
-    jenkins: buildkit
+    jenkins: "buildkit"
 spec:
   serviceAccountName: jenkins
   restartPolicy: Never
-  containers:
-  - name: buildctl
-    image: moby/buildkit:rootless
-    command: ["cat"]
-    tty: true
-    volumeMounts:
-    - name: tls
-      mountPath: /tls
-      readOnly: true
-    - name: workspace-volume
-      mountPath: /home/jenkins/agent
-  - name: git
-    image: alpine/git:2.45.2
-    command: ["cat"]
-    tty: true
-    securityContext:
-      runAsUser: 0
-      runAsGroup: 0
-    volumeMounts:
-    - name: workspace-volume
-      mountPath: /home/jenkins/agent
-  - name: yq
-    image: ghcr.io/mikefarah/yq:4
-    command: ["cat"]
-    tty: true
-    securityContext:
-      runAsUser: 0
-      runAsGroup: 0
-    volumeMounts:
-    - name: workspace-volume
-      mountPath: /home/jenkins/agent
-  - name: curl
-    image: curlimages/curl:8.10.1
-    command: ["cat"]
-    tty: true
-    volumeMounts:
-    - name: workspace-volume
-      mountPath: /home/jenkins/agent
   volumes:
-  - name: tls
-    secret:
-      secretName: buildkit-client-tls
-  - name: workspace-volume
-    emptyDir: {}
+    - name: tls
+      secret:
+        secretName: buildkit-client-tls
+    - name: workspace-volume
+      emptyDir: {}
+  containers:
+    - name: buildctl
+      image: moby/buildkit:rootless
+      command: ["cat"]
+      tty: true
+      volumeMounts:
+        - { name: tls, mountPath: /tls, readOnly: true }
+        - { name: workspace-volume, mountPath: /home/jenkins/agent }
+    - name: git
+      image: alpine/git:2.45.2
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+      command: ["cat"]
+      tty: true
+      volumeMounts:
+        - { name: workspace-volume, mountPath: /home/jenkins/agent }
+    - name: yq
+      image: ghcr.io/mikefarah/yq:4
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+      command: ["cat"]
+      tty: true
+      volumeMounts:
+        - { name: workspace-volume, mountPath: /home/jenkins/agent }
+    - name: utils
+      image: alpine:3.20
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+      command: ["cat"]
+      tty: true
+      volumeMounts:
+        - { name: workspace-volume, mountPath: /home/jenkins/agent }
 """
     }
-  }
-
-  options {
-    // Jenkins 구버전/플러그인 환경 호환: timestamps(), ansiColor() 제거
-    disableResume()
   }
 
   parameters {
     choice(
       name: 'SERVICE',
       choices: 'user-service\nfile-service\npost-service\nfrontend\nnginx',
-      description: '빌드/배포할 서비스 선택'
+      description: '빌드할 서비스(디렉터리) 선택'
     )
-    string(
-      name: 'IMAGE_TAG',
-      defaultValue: '',
-      description: '지정 시 해당 태그로 빌드/푸시 (미지정 시 vN 자동 증가)'
-    )
-    booleanParam(
-      name: 'BUMP_MANIFEST',
-      defaultValue: true,
-      description: '푸시 성공 시 deploy_manifest의 kustomization.yaml newTag 자동 갱신'
-    )
+    string(name: 'IMAGE_TAG', defaultValue: '', description: '지정하면 해당 태그로 푸시, 비우면 vN 자동 증가')
+    // ✅ 실제 Jenkins 크리덴셜 ID로 기본값 맞춤
+    string(name: 'GIT_CRED_ID',   defaultValue: 'GITHUB_PAT', description: 'GitHub(소스/manifest) PAT 크리덴셜 ID')
+    string(name: 'GHCR_CRED_ID',  defaultValue: 'ghcr',       description: 'GHCR(이미지 푸시) PAT 크리덴셜 ID')
+  }
+
+  options {
+    // 문제가 되었던 timestamps(), ansiColor()는 옵션이 아님 — 제거
+    disableResume()
+    durabilityHint('PERFORMANCE_OPTIMIZED')
+    skipDefaultCheckout(true) // Declarative 자동 체크아웃 생략
   }
 
   environment {
-    GIT_ORG_REPO = 'DRSOL-HA/WebBoard-Service'   // 모노레포
-    MANIFEST_REPO = 'DRSOL-HA/deploy_manifest'   // 쿠스토마이즈 매니페스트
-    GHCR_OWNER = 'drsol-ha'                      // GHCR owner/org (소문자 권장)
+    REGISTRY = 'ghcr.io'
+    ORG      = 'drsol-ha' // GHCR 오너(조직) — 소문자 권장
   }
 
   stages {
 
+    stage('Checkout Jenkinsfile repo (self)') {
+      steps {
+        // Jenkinsfile 저장소만 가볍게 체크아웃 (추가 소스는 다음 stage에서 별도로 clone)
+        checkout scm
+      }
+    }
+
+    stage('Init env (mapping)') {
+      steps {
+        script {
+          // 서비스 -> 이미지 리포 이름 매핑
+          def imageMap = [
+            'user-service': 'board-user-service',
+            'file-service': 'board-file-service',
+            'post-service': 'board-post-service',
+            'frontend'    : 'board-frontend',
+            'nginx'       : 'board-nginx',
+          ]
+          if (!imageMap.containsKey(params.SERVICE)) {
+            error "Unknown SERVICE: ${params.SERVICE}"
+          }
+          env.IMAGE_REPO = imageMap[params.SERVICE]
+
+          // 모든 서비스가 동일 저장소를 쓰는 현재 구조
+          def repoMap = [
+            'user-service': 'https://github.com/DRSOL-HA/WebBoard-Service.git',
+            'file-service': 'https://github.com/DRSOL-HA/WebBoard-Service.git',
+            'post-service': 'https://github.com/DRSOL-HA/WebBoard-Service.git',
+            'frontend'    : 'https://github.com/DRSOL-HA/WebBoard-Service.git',
+            'nginx'       : 'https://github.com/DRSOL-HA/WebBoard-Service.git',
+          ]
+          env.SRC_REPO = repoMap[params.SERVICE]
+        }
+      }
+    }
+
     stage('Checkout service code') {
       steps {
         container('git') {
-          withCredentials([usernamePassword(credentialsId: 'GH_PAT', usernameVariable: 'GH_USER', passwordVariable: 'GH_PASS')]) {
+          withCredentials([usernamePassword(credentialsId: params.GIT_CRED_ID, usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
             sh '''
-              set -euo pipefail
-              rm -rf src
-              mkdir -p src
-              AUTH="$(printf '%s:%s' "$GH_USER" "$GH_PASS" | base64 | tr -d '\\n')"
+              set -eu
+              rm -rf src && mkdir -p src
+              AUTH=$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\\n')
               git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH}" \
-                  clone --depth=1 -b main https://github.com/${GIT_ORG_REPO}.git src/app
+                  clone --depth=1 -b main "${SRC_REPO}" src/app
             '''
           }
         }
@@ -118,46 +144,26 @@ spec:
 
     stage('Resolve build context') {
       steps {
-        container('git') {
-          script {
-            // SERVICE -> GHCR repo명 매핑
-            def IMAGE_REPOS = [
-              'user-service': 'board-user-service',
-              'file-service': 'board-file-service',
-              'post-service': 'board-post-service',
-              'frontend'    : 'board-frontend',
-              'nginx'       : 'board-nginx',
-            ]
-            def repoName = IMAGE_REPOS[params.SERVICE]
-            if (!repoName) {
-              error "Unknown SERVICE '${params.SERVICE}' (IMAGE_REPOS 매핑 누락)"
-            }
-            env.IMAGE_REPO_NAME = repoName
-            env.IMAGE_NAME = "ghcr.io/${env.GHCR_OWNER}/${env.IMAGE_REPO_NAME}"
-          }
-
+        container('yq') {
           sh '''
-            set -euo pipefail
+            set -eu
             HINT="$(printf '%s' "${SERVICE}" | sed 's/-service$//')"
-
             FOUND=""
-            for P in \
-              "src/app/services/${SERVICE}" "src/app/services/${HINT}" \
-              "src/app/apps/${SERVICE}"     "src/app/apps/${HINT}" \
-              "src/app/packages/${SERVICE}" "src/app/packages/${HINT}" \
-              "src/app/${SERVICE}"; do
-              if [ -d "$P" ] && [ -f "$P/Dockerfile" ]; then
-                FOUND="$(basename "$P")"
-                echo "$FOUND" > .build_context_path
-                echo "Detected build context: $FOUND"
-                break
-              fi
+            for p in \
+              "src/app/services/${SERVICE}" \
+              "src/app/services/${HINT}" \
+              "src/app/apps/${SERVICE}" \
+              "src/app/apps/${HINT}" \
+              "src/app/packages/${SERVICE}" \
+              "src/app/packages/${HINT}" \
+              "src/app/${SERVICE}" \
+              "src/app/${HINT}"; do
+              if [ -f "${p}/Dockerfile" ]; then FOUND="$(basename "$p")"; echo "$FOUND" > .build_context_path; break; fi
             done
-
-            if [ ! -s .build_context_path ]; then
-              echo "서비스 빌드 컨텍스트를 찾지 못했습니다. src/app/**/<SERVICE>/Dockerfile 구조를 확인하세요." >&2
-              exit 10
-            fi
+            test -s .build_context_path && echo "Detected build context: $(cat .build_context_path)" || {
+              echo "ERROR: Dockerfile을 찾을 수 없습니다 (SERVICE=${SERVICE})." >&2
+              exit 2
+            }
           '''
         }
       }
@@ -165,44 +171,35 @@ spec:
 
     stage('Sanity: GHCR push permission') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'GHCR_PAT', usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_TOKEN')]) {
-          // 1) push scope 토큰 발급 (curl 컨테이너)
-          container('curl') {
+        container('utils') {
+          withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'GHCR_USR', passwordVariable: 'GHCR_PSW')]) {
             sh '''
-              set -euo pipefail
-              REPO="${IMAGE_REPO_NAME}"
-              curl -sS -u "${GHCR_USER}:${GHCR_TOKEN}" \
-                "https://ghcr.io/token?service=ghcr.io&scope=repository:${GHCR_OWNER}/${REPO}:pull,push" \
-                -o token.json
-            '''
-          }
-          // 2) token.json에서 token 추출 (yq 컨테이너)
-          container('yq') {
-            sh '''
-              set -euo pipefail
-              TOKEN="$(yq -p=json -r '.token // ""' token.json)"
-              if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
-                echo "ERROR: GHCR 토큰을 발급받지 못했습니다. GHCR_PAT 권한/SSO를 확인하세요." >&2
+              set -eu
+              apk add --no-cache curl jq ca-certificates >/dev/null
+              REPO="${IMAGE_REPO}"
+
+              # Bearer 토큰(PUSH 스코프) 취득
+              TOKEN="$(curl -sS -u "${GHCR_USR}:${GHCR_PSW}" \
+                "https://ghcr.io/token?service=ghcr.io&scope=repository:${ORG}/${REPO}:pull,push" | jq -r .token)"
+
+              if [ -z "${TOKEN}" ] || [ "${TOKEN}" = "null" ]; then
+                echo "ERROR: GHCR 토큰을 받지 못했습니다. (크리덴셜/SSO/권한 확인)" >&2
                 exit 90
               fi
-              echo "$TOKEN" > .ghcr_token
-            '''
-          }
-          // 3) 실제 업로드 세션 시작으로 push권한 사전검증 (curl 컨테이너)
-          container('curl') {
-            sh '''
-              set -euo pipefail
-              REPO="${IMAGE_REPO_NAME}"
-              TOKEN="$(cat .ghcr_token)"
-              CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
-                -H "Authorization: Bearer ${TOKEN}" \
-                "https://ghcr.io/v2/${GHCR_OWNER}/${REPO}/blobs/uploads/")"
 
-              if [ "${CODE}" -lt 200 ] || [ "${CODE}" -ge 300 ]; then
-                echo "ERROR: GHCR push 사전 검증 실패(HTTP ${CODE}). PAT에 write:packages 권한 및 조직 SSO 승인이 필요합니다." >&2
-                exit 91
-              fi
-              echo "OK: GHCR push 권한 사전검증 통과"
+              # 업로드 세션(빈 업로드) 열어 보기 — 202(혹은 201)이면 OK
+              CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
+                -H "Authorization: Bearer ${TOKEN}" \
+                -X POST "https://ghcr.io/v2/${ORG}/${REPO}/blobs/uploads/")"
+
+              case "${CODE}" in
+                201|202) echo "GHCR push check OK (${CODE})" ;;
+                401|403) echo "ERROR: GHCR 권한 거부(${CODE}). PAT에 write:packages 및 Org SSO 승인 필요." >&2; exit 91 ;;
+                404)     echo "ERROR: Package(${ORG}/${REPO})가 존재하지 않습니다. 최초 생성 권한/설정 확인." >&2; exit 92 ;;
+                *)       echo "ERROR: GHCR 업로드 세션 실패 (HTTP ${CODE})." >&2; exit 93 ;;
+              esac
+
+              touch .push_ok
             '''
           }
         }
@@ -210,48 +207,24 @@ spec:
     }
 
     stage('Decide IMAGE_TAG (auto bump when empty)') {
-      when { expression { return (params.IMAGE_TAG?.trim() ?: '') == '' } }
+      when { expression { return (params.IMAGE_TAG?.trim() == '') } }
       steps {
-        withCredentials([usernamePassword(credentialsId: 'GHCR_PAT', usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_TOKEN')]) {
-          // tags 조회 (curl)
-          container('curl') {
+        container('utils') {
+          withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'GHCR_USR', passwordVariable: 'GHCR_PSW')]) {
             sh '''
-              set -euo pipefail
-              OWNER="${GHCR_OWNER}"
-              REPO="${IMAGE_REPO_NAME}"
-              curl -sS -u "${GHCR_USER}:${GHCR_TOKEN}" \
-                "https://ghcr.io/token?service=ghcr.io&scope=repository:${OWNER}/${REPO}:pull" \
-                -o token.json
-              TOKEN="$(cat token.json)"
-              CODE="$(echo "$TOKEN" | wc -c)"
-              [ "$CODE" -gt 0 ] || { echo "ERROR: GHCR 토큰 발급 실패(pull scope)" >&2; exit 92; }
+              set -eu
+              apk add --no-cache curl jq ca-certificates >/dev/null
+              TOKEN="$(curl -sS -u "${GHCR_USR}:${GHCR_PSW}" \
+                "https://ghcr.io/token?service=ghcr.io&scope=repository:${ORG}/${IMAGE_REPO}:pull" | jq -r .token)"
 
-              REAL_TOKEN="$(echo "$TOKEN" | sed -n 's/.*"token":"\\([^"]*\\)".*/\\1/p')"
-              [ -n "$REAL_TOKEN" ] || { echo "ERROR: token 파싱 실패" >&2; exit 92; }
+              curl -sS -H "Authorization: Bearer ${TOKEN}" \
+                "https://ghcr.io/v2/${ORG}/${IMAGE_REPO}/tags/list?n=1000" > tags.json || echo '{"tags":[]}' > tags.json
 
-              HTTP="$(curl -sS -o tags.json -w '%{http_code}' \
-                -H "Authorization: Bearer ${REAL_TOKEN}" \
-                "https://ghcr.io/v2/${OWNER}/${REPO}/tags/list?n=1000")"
-
-              if [ "${HTTP}" -lt 200 ] || [ "${HTTP}" -ge 300 ]; then
-                echo "ERROR: GHCR tags 조회 실패 (HTTP ${HTTP})" >&2
-                exit 93
-              fi
-            '''
-          }
-          // NEXT_TAG 계산 (yq)
-          container('yq') {
-            sh '''
-              set -euo pipefail
-              NEXT_TAG="$(
-                yq -p=json -r '
-                  .tags // [] 
-                  | map(select(test("^v[0-9]+$"))) 
-                  | (map(sub("^v";"") | tonumber) | max // 0) + 1
-                  | "v" + tostring
-                ' tags.json
-              )"
-              echo "${NEXT_TAG}" | tee .image_tag
+              NEXT_TAG="$(jq -r '
+                  (.tags // []) | map(select(test("^v[0-9]+$"))) |
+                  (map(sub("^v";"")|tonumber) | max // 0) + 1 | "v"+tostring
+                ' tags.json)"
+              echo "${NEXT_TAG}" > .image_tag
               echo "Auto-decided IMAGE_TAG: ${NEXT_TAG}"
             '''
           }
@@ -260,12 +233,12 @@ spec:
     }
 
     stage('Use provided IMAGE_TAG (if any)') {
-      when { expression { return (params.IMAGE_TAG?.trim() ?: '') != '' } }
+      when { expression { return (params.IMAGE_TAG?.trim() != '') } }
       steps {
         sh '''
-          set -euo pipefail
-          echo "${IMAGE_TAG}" | tee .image_tag
-          echo "Using IMAGE_TAG=${IMAGE_TAG}"
+          set -eu
+          printf '%s' "${IMAGE_TAG}" > .image_tag
+          echo "Using IMAGE_TAG=$(cat .image_tag)"
         '''
       }
     }
@@ -273,36 +246,30 @@ spec:
     stage('Build & Push image') {
       steps {
         container('buildctl') {
-          withCredentials([usernamePassword(credentialsId: 'GHCR_PAT', usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_TOKEN')]) {
+          withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'GHCR_USR', passwordVariable: 'GHCR_PSW')]) {
             sh '''
-              set -euo pipefail
-
+              set -eu
               CONTEXT_PATH="$(cat .build_context_path)"
               IMAGE_TAG="$(cat .image_tag)"
-              IMAGE_NAME="${IMAGE_NAME}"
-              META="${PWD}/.buildmeta.json"
+              IMAGE_NAME="${REGISTRY}/${ORG}/${IMAGE_REPO}"
 
-              export HOME="${WORKSPACE}"
-              export DOCKER_CONFIG="${WORKSPACE}/.docker"
-              mkdir -p "${DOCKER_CONFIG}"
+              export HOME="$PWD"
+              export DOCKER_CONFIG="$PWD/.docker"
+              mkdir -p "$DOCKER_CONFIG"
 
-              AUTH="$(printf '%s:%s' "$GHCR_USER" "$GHCR_TOKEN" | base64 | tr -d '\\n')"
-              printf '{ "auths": { "ghcr.io": { "auth": "%s" } } }\n' "${AUTH}" > "${DOCKER_CONFIG}/config.json"
+              AUTH="$(printf '%s:%s' "${GHCR_USR}" "${GHCR_PSW}" | base64 | tr -d '\\n')"
+              printf '{ "auths": { "%s": { "auth": "%s" } } }\n' "${REGISTRY}" "${AUTH}" > "$DOCKER_CONFIG/config.json"
 
               echo "[buildctl] building ${IMAGE_NAME}:${IMAGE_TAG} from ${CONTEXT_PATH}"
               buildctl --addr tcp://buildkitd.buildkit.svc.cluster.local:1234 \
-                --tlscacert /tls/ca.crt \
-                --tlscert /tls/client.crt \
-                --tlskey /tls/client.key \
+                --tlscacert /tls/ca.crt --tlscert /tls/client.crt --tlskey /tls/client.key \
                 build \
                   --frontend=dockerfile.v0 \
                   --local "context=src/app/${CONTEXT_PATH}" \
                   --local "dockerfile=src/app/${CONTEXT_PATH}" \
                   --output "type=image,name=${IMAGE_NAME}:${IMAGE_TAG},push=true" \
                   --progress=plain \
-                  --metadata-file "${META}"
-
-              echo ok > .push_ok
+                  --metadata-file "$PWD/.buildmeta.json"
             '''
           }
         }
@@ -310,64 +277,41 @@ spec:
     }
 
     stage('Bump manifest tag') {
-      when {
-        allOf {
-          expression { return params.BUMP_MANIFEST }
-          expression { return fileExists('.push_ok') }
-        }
-      }
+      when { expression { return fileExists('.image_tag') && fileExists('.push_ok') } }
       steps {
         container('git') {
-          withCredentials([usernamePassword(credentialsId: 'GH_PAT', usernameVariable: 'GH_USER', passwordVariable: 'GH_PASS')]) {
+          withCredentials([usernamePassword(credentialsId: params.GIT_CRED_ID, usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
             sh '''
-              set -euo pipefail
-              rm -rf manifest
-              mkdir -p manifest
-              cd manifest
-
-              AUTH="$(printf '%s:%s' "$GH_USER" "$GH_PASS" | base64 | tr -d '\\n')"
+              set -eu
+              rm -rf manifest && mkdir -p manifest && cd manifest
+              AUTH="$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\\n')"
               git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH}" \
-                clone --depth=1 https://github.com/${MANIFEST_REPO}.git repo
+                  clone --depth=1 https://github.com/DRSOL-HA/deploy_manifest.git repo
 
               cd repo
-              git config user.name "jenkins"
+              IMAGE_LOWER="ghcr.io/${ORG}/${IMAGE_REPO}"
+              IMAGE_UPPER="ghcr.io/${ORG.toUpperCase()}/${IMAGE_REPO}"
+
+              FILE="apps/board/kustomization.yaml"
+              test -f "${FILE}"
+
+              export NEW_TAG="$(cat "$WORKSPACE/.image_tag")"
+              export IMG_LOWER="${IMAGE_LOWER}"
+              export IMG_UPPER="${IMAGE_UPPER}"
+
+              # yq v4: JSON/YAML 모두 처리 가능
+              yq -i '
+                (.images[] | select((.name == strenv(IMG_LOWER)) or (.name == strenv(IMG_UPPER))).newTag)
+                = strenv(NEW_TAG)
+              ' "${FILE}"
+
+              git config user.name  "jenkins"
               git config user.email "ci@drsol-ha.local"
-            '''
-          }
-        }
-        container('yq') {
-          sh '''
-            set -euo pipefail
-            cd manifest/repo
-
-            FILE="apps/board/kustomization.yaml"
-            test -f "${FILE}" || { echo "manifest 파일을 찾을 수 없습니다: ${FILE}" >&2; exit 120; }
-
-            export IMG_LOWER="${IMAGE_NAME}"
-            export IMG_UPPER="$(echo "${IMAGE_NAME}" | sed 's|ghcr.io/drsol-ha/|ghcr.io/DRSOL-HA/|')"
-            export NEW_TAG="$(cat "${WORKSPACE}/.image_tag")"
-
-            yq -i '
-              (.images[] | select((.name == strenv(IMG_LOWER)) or (.name == strenv(IMG_UPPER))).newTag)
-              = strenv(NEW_TAG)
-            ' "${FILE}"
-          '''
-        }
-        container('git') {
-          withCredentials([usernamePassword(credentialsId: 'GH_PAT', usernameVariable: 'GH_USER', passwordVariable: 'GH_PASS')]) {
-            sh '''
-              set -euo pipefail
-              cd manifest/repo
               git add -A
-              if git diff --cached --quiet -- . ; then
-                echo "매니페스트 변경 없음 (이미 동일 태그일 수 있음)"
-                exit 0
-              fi
-              MSG="ci: bump ${IMAGE_REPO_NAME} -> $(cat ${WORKSPACE}/.image_tag)"
-              git commit -m "${MSG}"
+              git commit -m "ci: bump ${IMAGE_REPO} -> ${NEW_TAG}" || true
 
-              AUTH="$(printf '%s:%s' "$GH_USER" "$GH_PASS" | base64 | tr -d '\\n')"
-              git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH}" push origin HEAD:main
+              AUTH_PUSH="$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\\n')"
+              git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH_PUSH}" push origin HEAD:main
             '''
           }
         }
@@ -380,14 +324,10 @@ spec:
       script {
         echo "SERVICE=${params.SERVICE}"
         sh '''
-          set -euo pipefail
+          set -eu
           ls -lA || true
-          [ -f .image_tag ] && echo "IMAGE_TAG=$(cat .image_tag)" || true
-          if [ -f .push_ok ]; then
-            echo ".push_ok exists (push succeeded)"
-          else
-            echo ".push_ok missing"
-          fi
+          if [ -f .image_tag ]; then echo "IMAGE_TAG=$(cat .image_tag)"; fi
+          if [ -f .push_ok ]; then echo ".push_ok present"; else echo ".push_ok missing"; fi
         '''
       }
     }
