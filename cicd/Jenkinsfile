@@ -65,7 +65,7 @@ spec:
   }
 
   parameters {
-    // 비우면 서비스별 vN 자동 증가, 채우면 모든 서비스에 동일 태그 적용
+    // 비우면 서비스별 vN 자동 증가, 채우면 모든 서비스에 동일 태그 적용.
     string(name: 'IMAGE_TAG',  defaultValue: '',            description: '모든 서비스 공통 태그(비우면 vN 자동증가)')
     // Jenkins Credentials ID
     string(name: 'GIT_CRED_ID',  defaultValue: 'GITHUB_PAT', description: 'GitHub(소스/manifest) PAT 크리덴셜 ID')
