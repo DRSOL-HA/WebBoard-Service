@@ -59,15 +59,11 @@ spec:
   }
 
   parameters {
-    // ⬇ 기본값을 auto 로. 필요하면 ALL 로 전체 빌드 가능
-    choice(name: 'SERVICE',
-      choices: 'auto\nALL\nuser-service\nfile-service\npost-service\nfrontend\nnginx',
-      description: 'auto=마지막 커밋에서 변경된 서비스 자동 감지, ALL=전부 빌드')
-    // 선택적으로 여러 개를 콤마로 직접 지정하고 싶다면 (예: "file-service,frontend")
-    string(name: 'SERVICES_CSV', defaultValue: '', description: '여러 서비스 수동 지정(쉼표구분). 비우면 SERVICE 사용')
-    string(name: 'IMAGE_TAG', defaultValue: '', description: '비우면 vN 자동 증가')
-    string(name: 'GIT_CRED_ID',  defaultValue: 'GITHUB_PAT', description: 'GitHub 소스/매니페스트 PAT')
-    string(name: 'GHCR_CRED_ID', defaultValue: 'ghcr-owner', description: 'GHCR PAT (push 권한)')
+    // 선택적으로 모든 서비스에 동일 태그를 강제하고 싶으면 IMAGE_TAG 지정
+    string(name: 'IMAGE_TAG', defaultValue: '', description: '모든 서비스에 공통 적용할 태그 (비우면 서비스별 vN 자동 증가)')
+    // Jenkins Credentials ID
+    string(name: 'GIT_CRED_ID',  defaultValue: 'GITHUB_PAT',  description: 'GitHub(소스/manifest) PAT 크리덴셜 ID')
+    string(name: 'GHCR_CRED_ID', defaultValue: 'ghcr-owner',  description: 'GHCR(이미지 푸시) PAT 크리덴셜 ID')
   }
 
   options {
@@ -78,14 +74,12 @@ spec:
 
   environment {
     REGISTRY = 'ghcr.io'
-    ORG      = 'drsol-ha'
+    ORG      = 'drsol-ha'  // 소문자 권장
   }
 
   stages {
-    stage('Checkout Jenkinsfile repo (self)') {
-      steps { checkout scm }
-    }
 
+    // 1) 앱 저장소 체크아웃
     stage('Checkout app repo') {
       steps {
         container('git') {
@@ -103,49 +97,52 @@ spec:
       }
     }
 
+    // 2) 변경된 서비스 감지 (최근 커밋 기준). 없으면 user-service만 빌드
     stage('Detect services to build') {
       steps {
         script {
-          def selected = [] as Set
-          if (params.SERVICES_CSV?.trim()) {
-            params.SERVICES_CSV.split(/\s*,\s*/).each { s ->
-              if (IMAGE_MAP.containsKey(s)) selected << s
-            }
-          } else if (params.SERVICE == 'ALL') {
-            selected.addAll(ALL_SERVICES)
-          } else if (params.SERVICE == 'auto') {
-            // 마지막 커밋에서 변경된 상위 디렉토리 기준 감지
-            container('git') {
-              sh """
-                set -eu
-                git -C src/app show --name-only --pretty='' HEAD > .changed || true
-                awk -F/ '
-                  BEGIN {print ""} 
-                  /^(user-service|file-service|post-service|frontend|nginx)\\// {print \$1}
-                ' .changed | sort -u > .services
-              """
-            }
-            def txt = readFile('.services').trim()
-            if (txt) txt.split('\n').each { s -> if (IMAGE_MAP.containsKey(s)) selected << s }
-          } else {
-            if (IMAGE_MAP.containsKey(params.SERVICE)) selected << params.SERVICE
-          }
-          if (selected.isEmpty()) error "빌드할 서비스가 없습니다. (SERVICE=${params.SERVICE}, SERVICES_CSV='${params.SERVICES_CSV}')"
-          writeFile file: '.services', text: selected.join('\n') + '\n'
-          echo "빌드 대상: ${selected.join(', ')}"
+          // 쉘에서 생성한 목록을 파일로 남김(.services)
         }
+        sh '''
+          set -eu
+          cd src/app
+          # 최근 커밋 기준 변경 파일 목록(깃훅 트리거 시 depth=2 이므로 HEAD~1..HEAD 가능)
+          CHANGED="$(git diff --name-only HEAD~1..HEAD || true)"
+          cd - >/dev/null
+
+          SERVICES=""
+
+          for s in user-service file-service post-service frontend nginx; do
+            if printf '%s\n' "$CHANGED" | grep -E "^${s}(/|$)" >/dev/null 2>&1; then
+              SERVICES="${SERVICES}\\n${s}"
+            fi
+          done
+
+          # 변경 없으면 기본으로 user-service만
+          if [ -z "${SERVICES#\\n}" ]; then
+            SERVICES="user-service"
+          else
+            # 앞의 개행 제거
+            SERVICES="$(printf '%b' "$SERVICES" | sed '/^$/d')"
+          fi
+
+          printf '%s\n' "$SERVICES" > .services
+          echo "빌드 대상:"
+          cat .services
+        '''
       }
     }
 
+    // 3) (서비스별) GHCR 푸시 권한 확인
     stage('Sanity: GHCR push permission (each)') {
       steps {
         container('utils') {
-          withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'U', passwordVariable: 'P')]) {
+          withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'GHCR_USR', passwordVariable: 'GHCR_PSW')]) {
             sh '''
               set -eu
               apk add --no-cache curl jq ca-certificates >/dev/null
-              > .push_ok
-              while read -r SVC; do
+
+              while read -r SVC || [ -n "$SVC" ]; do
                 [ -n "$SVC" ] || continue
                 case "$SVC" in
                   user-service) REPO="board-user-service" ;;
@@ -155,29 +152,43 @@ spec:
                   nginx)        REPO="board-nginx" ;;
                   *) echo "Unknown service: $SVC" >&2; exit 2 ;;
                 esac
-                TOKEN="$(curl -sS -u "${U}:${P}" "https://ghcr.io/token?service=ghcr.io&scope=repository:${ORG}/${REPO}:pull,push" | jq -r .token)"
-                [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || { echo "GHCR token fail for ${REPO}"; exit 91; }
-                CODE="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" -X POST "https://ghcr.io/v2/${ORG}/${REPO}/blobs/uploads/")"
-                case "$CODE" in 201|202) : ;; 401|403) echo "권한거부 ${REPO}"; exit 91 ;; 404) echo "미존재 ${REPO}"; exit 92 ;; *) echo "HTTP ${CODE} ${REPO}"; exit 93 ;; esac
+
+                TOKEN="$(curl -sS -u "${GHCR_USR}:${GHCR_PSW}" \
+                  "https://ghcr.io/token?service=ghcr.io&scope=repository:${ORG}/${REPO}:pull,push" | jq -r .token)"
+
+                [ -n "${TOKEN}" ] && [ "${TOKEN}" != "null" ] || { echo "ERROR: GHCR 토큰 실패(${SVC})." >&2; exit 90; }
+
+                CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
+                  -H "Authorization: Bearer ${TOKEN}" \
+                  -X POST "https://ghcr.io/v2/${ORG}/${REPO}/blobs/uploads/")"
+
+                case "$CODE" in
+                  201|202) : ;;
+                  401|403) echo "ERROR: GHCR 권한(${SVC}) 거부(${CODE})." >&2; exit 91 ;;
+                  404)     echo "ERROR: 패키지(${REPO}) 없음(${CODE})." >&2; exit 92 ;;
+                  *)       echo "ERROR: 업로드 세션 실패(${SVC}) HTTP ${CODE}." >&2; exit 93 ;;
+                esac
               done < .services
-              # 표식
-              : > .push_ok
+
+              touch .push_ok
             '''
           }
         }
       }
     }
 
+    // 4) (서비스별) 태그 결정
     stage('Decide tags (each)') {
       when { expression { return (params.IMAGE_TAG?.trim() == '') } }
       steps {
         container('utils') {
-          withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'U', passwordVariable: 'P')]) {
+          withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'GHCR_USR', passwordVariable: 'GHCR_PSW')]) {
             sh '''
               set -eu
               apk add --no-cache curl jq ca-certificates >/dev/null
               : > .tags
-              while read -r SVC; do
+
+              while read -r SVC || [ -n "$SVC" ]; do
                 [ -n "$SVC" ] || continue
                 case "$SVC" in
                   user-service) REPO="board-user-service" ;;
@@ -186,11 +197,18 @@ spec:
                   frontend)     REPO="board-frontend" ;;
                   nginx)        REPO="board-nginx" ;;
                 esac
-                TOKEN="$(curl -sS -u "${U}:${P}" "https://ghcr.io/token?service=ghcr.io&scope=repository:${ORG}/${REPO}:pull" | jq -r .token)"
-                curl -sS -H "Authorization: Bearer ${TOKEN}" "https://ghcr.io/v2/${ORG}/${REPO}/tags/list?n=1000" > tags.json || echo '{"tags":[]}' > tags.json
+
+                TOKEN="$(curl -sS -u "${GHCR_USR}:${GHCR_PSW}" \
+                  "https://ghcr.io/token?service=ghcr.io&scope=repository:${ORG}/${REPO}:pull" | jq -r .token)"
+
+                curl -sS -H "Authorization: Bearer ${TOKEN}" \
+                  "https://ghcr.io/v2/${ORG}/${REPO}/tags/list?n=1000" > tags.json || echo '{"tags":[]}' > tags.json
+
                 NEXT="$(jq -r '(.tags // []) | map(select(test("^v[0-9]+$"))) | (map(sub("^v";"")|tonumber) | max // 0) + 1 | "v"+tostring' tags.json)"
                 echo "${SVC}:${NEXT}" >> .tags
               done < .services
+
+              echo "태그 결정:"
               cat .tags
             '''
           }
@@ -198,36 +216,40 @@ spec:
       }
     }
 
+    // 5) 공통 태그 강제 (선택)
     stage('Use provided IMAGE_TAG for all (optional)') {
       when { expression { return (params.IMAGE_TAG?.trim() != '') } }
       steps {
         sh '''
           set -eu
           : > .tags
-          while read -r SVC; do
+          while read -r SVC || [ -n "$SVC" ]; do
             [ -n "$SVC" ] || continue
             echo "${SVC}:${IMAGE_TAG}" >> .tags
           done < .services
+          echo "강제 태그:"
           cat .tags
         '''
       }
     }
 
+    // 6) 빌드 & 푸시 (서비스별)
     stage('Build & Push (each)') {
       steps {
         container('buildctl') {
-          withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'U', passwordVariable: 'P')]) {
+          withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'GHCR_USR', passwordVariable: 'GHCR_PSW')]) {
             sh '''
               set -eu
               export HOME="$PWD"
               export DOCKER_CONFIG="$PWD/.docker"
               mkdir -p "$DOCKER_CONFIG"
-              AUTH="$(printf '%s:%s' "${U}" "${P}" | base64 | tr -d '\\n')"
+              AUTH="$(printf '%s:%s' "${GHCR_USR}" "${GHCR_PSW}" | base64 | tr -d '\\n')"
               printf '{ "auths": { "%s": { "auth": "%s" } } }\n' "${REGISTRY}" "${AUTH}" > "$DOCKER_CONFIG/config.json"
 
-              while IFS=':' read -r SVC TAG; do
+              while IFS=':' read -r SVC TAG || [ -n "$SVC" ]; do
                 [ -n "$SVC" ] || continue
-                [ -n "$TAG" ] || continue
+                [ -n "$TAG" ] || { echo "TAG 누락: $SVC" >&2; exit 2; }
+
                 case "$SVC" in
                   user-service) REPO="board-user-service" ;;
                   file-service) REPO="board-file-service" ;;
@@ -235,11 +257,13 @@ spec:
                   frontend)     REPO="board-frontend" ;;
                   nginx)        REPO="board-nginx" ;;
                 esac
+
                 CONTEXT="src/app/${SVC}"
-                test -f "${CONTEXT}/Dockerfile"
+                test -f "${CONTEXT}/Dockerfile" || { echo "Dockerfile 없음: ${CONTEXT}" >&2; exit 3; }
 
                 IMAGE="${REGISTRY}/${ORG}/${REPO}"
                 echo "[buildctl] ${SVC} -> ${IMAGE}:${TAG}"
+
                 buildctl --addr tcp://buildkitd.buildkit.svc.cluster.local:1234 \
                   --tlscacert /tls/ca.crt --tlscert /tls/client.crt --tlskey /tls/client.key \
                   build \
@@ -256,79 +280,82 @@ spec:
       }
     }
 
-stage('Bump manifest (single commit)') {
-  when { expression { return fileExists('.push_ok') && fileExists('.tags') } }
-  steps {
-    // 1) clone (git 컨테이너)
-    container('git') {
-      withCredentials([usernamePassword(credentialsId: params.GIT_CRED_ID, usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
-        sh '''
-          set -eu
-          rm -rf manifest && mkdir -p manifest && cd manifest
-          AUTH="$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\\n')"
-          git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH}" \
-              clone --depth=1 https://github.com/DRSOL-HA/deploy_manifest.git repo
-        '''
+    // 7) 매니페스트 버전 범프 (단일 커밋)
+    stage('Bump manifest (single commit)') {
+      when { expression { return fileExists('.push_ok') && fileExists('.tags') } }
+      steps {
+        // 7-1 clone (git 컨테이너)
+        container('git') {
+          withCredentials([usernamePassword(credentialsId: params.GIT_CRED_ID, usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
+            sh '''
+              set -eu
+              rm -rf manifest && mkdir -p manifest && cd manifest
+              AUTH="$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\\n')"
+              git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH}" \
+                  clone --depth=1 https://github.com/DRSOL-HA/deploy_manifest.git repo
+            '''
+          }
+        }
+
+        // 7-2 yq로 태그 갱신 (yq 컨테이너)
+        container('yq') {
+          sh '''
+            set -eu
+            cd manifest/repo
+            FILE="apps/board/kustomization.yaml"
+            test -f "${FILE}"
+
+            while IFS=':' read -r SVC TAG || [ -n "$SVC" ]; do
+              [ -n "$SVC" ] || continue
+              case "$SVC" in
+                user-service) IMG="ghcr.io/${ORG}/board-user-service" ;;
+                file-service) IMG="ghcr.io/${ORG}/board-file-service" ;;
+                post-service) IMG="ghcr.io/${ORG}/board-post-service" ;;
+                frontend)     IMG="ghcr.io/${ORG}/board-frontend" ;;
+                nginx)        IMG="ghcr.io/${ORG}/board-nginx" ;;
+                *) echo "unknown service: $SVC" >&2; exit 2 ;;
+              esac
+              IMAGE_NAME_CANON="$IMG"
+              NEW_TAG="$TAG"
+              yq -i '
+                (.images[] | select((.name | downcase) == (strenv(IMAGE_NAME_CANON) | downcase))).newTag
+                = strenv(NEW_TAG)
+              ' "${FILE}"
+            done < "$WORKSPACE/.tags"
+          '''
+        }
+
+        // 7-3 커밋 & 푸시 (git 컨테이너)
+        container('git') {
+          withCredentials([usernamePassword(credentialsId: params.GIT_CRED_ID, usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
+            sh '''
+              set -eu
+              cd manifest/repo
+              git config user.name  "jenkins"
+              git config user.email "ci@drsol-ha.local"
+              git add -A
+              MSG="ci: bump $(tr '\\n' ' ' < "$WORKSPACE/.tags")"
+              git commit -m "${MSG}" || true
+
+              AUTH_PUSH="$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\\n')"
+              git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH_PUSH}" push origin HEAD:main
+            '''
+          }
+        }
       }
     }
-
-    // 2) yq로 태그 수정 (yq 컨테이너)
-    container('yq') {
-      sh '''
-        set -eu
-        cd manifest/repo
-        FILE="apps/board/kustomization.yaml"
-        test -f "${FILE}"
-
-        # .tags: "service:tag" 형식
-        while IFS=':' read -r SVC TAG; do
-          [ -n "$SVC" ] || continue
-          case "$SVC" in
-            user-service) IMG="ghcr.io/${ORG}/board-user-service" ;;
-            file-service) IMG="ghcr.io/${ORG}/board-file-service" ;;
-            post-service) IMG="ghcr.io/${ORG}/board-post-service" ;;
-            frontend)     IMG="ghcr.io/${ORG}/board-frontend" ;;
-            nginx)        IMG="ghcr.io/${ORG}/board-nginx" ;;
-            *) echo "unknown service: $SVC" >&2; exit 2 ;;
-          esac
-          IMAGE_NAME_CANON="$IMG"
-          NEW_TAG="$TAG"
-          yq -i '
-            (.images[] | select((.name | downcase) == (strenv(IMAGE_NAME_CANON) | downcase))).newTag
-            = strenv(NEW_TAG)
-          ' "${FILE}"
-        done < "$WORKSPACE/.tags"
-      '''
-    }
-
-    // 3) commit & push (git 컨테이너)
-    container('git') {
-      withCredentials([usernamePassword(credentialsId: params.GIT_CRED_ID, usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
-        sh '''
-          set -eu
-          cd manifest/repo
-          git config user.name  "jenkins"
-          git config user.email "ci@drsol-ha.local"
-          git add -A
-          MSG="ci: bump $(tr '\\n' ' ' < "$WORKSPACE/.tags")"
-          git commit -m "${MSG}" || true
-
-          AUTH_PUSH="$(printf '%s:%s' "$GH_USER" "$GH_PAT" | base64 | tr -d '\\n')"
-          git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH_PUSH}" push origin HEAD:main
-        '''
-      }
-    }
-  }
-}
+  } // end stages
 
   post {
     always {
       script {
         sh '''
           set -eu
-          echo "HEAD_SHA=$(cat .head_sha || true)"
-          echo "SERVICES:" && cat .services || true
-          echo "TAGS:" && cat .tags || true
+          echo "HEAD_SHA=$(cat .head_sha 2>/dev/null || echo -n '-')"
+          echo "SERVICES:"
+          cat .services 2>/dev/null || true
+          echo "TAGS:"
+          cat .tags 2>/dev/null || true
         '''
       }
     }
