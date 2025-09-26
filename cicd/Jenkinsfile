@@ -130,6 +130,9 @@ spec:
     }
     // 3) (서비스별) GHCR 푸시 권한 확인
     stage('Sanity: GHCR push permission (each)') {
+      when {
+        expression { fileExists('.services') && readFile('.services').trim().length() > 0 }
+      }
       steps {
         container('utils') {
           withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'GHCR_USR', passwordVariable: 'GHCR_PSW')]) {
@@ -174,7 +177,9 @@ spec:
 
     // 4) (서비스별) 태그 결정
     stage('Decide tags (each)') {
-      when { expression { return (params.IMAGE_TAG?.trim() == '') } }
+      when {
+        expression { fileExists('.services') && readFile('.services').trim().length() > 0 }
+      }
       steps {
         container('utils') {
           withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'GHCR_USR', passwordVariable: 'GHCR_PSW')]) {
@@ -230,6 +235,9 @@ spec:
 
     // 6) 빌드 & 푸시 (서비스별)
     stage('Build & Push (each)') {
+      when {
+        expression { fileExists('.services') && readFile('.services').trim().length() > 0 }
+      }
       steps {
         container('buildctl') {
           withCredentials([usernamePassword(credentialsId: params.GHCR_CRED_ID, usernameVariable: 'GHCR_USR', passwordVariable: 'GHCR_PSW')]) {
@@ -277,7 +285,9 @@ spec:
 
     // 7) 매니페스트 버전 범프 (단일 커밋)
     stage('Bump manifest (single commit)') {
-      when { expression { return fileExists('.push_ok') && fileExists('.tags') } }
+      when {
+        expression { fileExists('.services') && readFile('.services').trim().length() > 0 }
+      }
       steps {
         // 7-1 clone (git 컨테이너)
         container('git') {
