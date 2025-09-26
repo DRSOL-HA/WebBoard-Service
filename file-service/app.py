@@ -31,7 +31,7 @@ def get_s3_client():
                 region_name=app.config['AWS_DEFAULT_REGION']
             )
     except Exception as e:
-        app.logger.error(f"S3 클라이언트 초기화 실패!: {e}")
+        app.logger.error(f"S3 클라이언트 초기화 실패: {e}")
         raise e
 
 def allowed_file(filename):
