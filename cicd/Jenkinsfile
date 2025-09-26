@@ -47,6 +47,12 @@ spec:
       tty: true
       volumeMounts:
         - { name: workspace-volume, mountPath: /home/jenkins/agent }
+    - name: kustomize
+      image: alpine:3.20
+      command: ["cat"]
+      tty: true
+      volumeMounts:
+        - { name: workspace-volume, mountPath: /home/jenkins/agent }   
     - name: utils
       image: alpine:3.20
       securityContext: { runAsUser: 0, runAsGroup: 0 }
@@ -320,14 +326,20 @@ spec:
           }
         }
 
-        // 7-2 yq로 태그 갱신 (yq 컨테이너)
-        container('yq') {
+         // 7-2 이미지 태그 갱신 (kustomize 컨테이너)
+        container('kustomize') {
           sh '''
             set -eu
-            cd manifest/repo
-            FILE="apps/board/kustomization.yaml"
-            test -f "${FILE}"
-
+            apk add --no-cache curl tar
+        
+            KVER="v5.4.2"
+            curl -sSL -o /tmp/kustomize.tgz \
+              "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KVER}/kustomize_${KVER}_linux_amd64.tar.gz"
+            tar -xzf /tmp/kustomize.tgz -C /usr/local/bin
+        
+            cd manifest/repo/apps/board
+            echo "== BEFORE ==" && grep -n -A1 "^images:" kustomization.yaml || true
+        
             while IFS=':' read -r SVC TAG || [ -n "$SVC" ]; do
               [ -n "$SVC" ] || continue
               case "$SVC" in
@@ -338,13 +350,10 @@ spec:
                 nginx)        IMG="ghcr.io/${ORG}/board-nginx" ;;
                 *) echo "unknown service: $SVC" >&2; exit 2 ;;
               esac
-              IMAGE_NAME_CANON="$IMG"
-              NEW_TAG="$TAG"
-              yq -i '
-                (.images[] | select((.name | downcase) == (strenv(IMAGE_NAME_CANON) | downcase))).newTag
-                = strenv(NEW_TAG)
-              ' "${FILE}"
+              /usr/local/bin/kustomize edit set image "${IMG}=${IMG}:${TAG}"
             done < "$WORKSPACE/.tags"
+        
+            echo "== AFTER ==" && grep -n -A1 "^images:" kustomization.yaml || true
           '''
         }
 
