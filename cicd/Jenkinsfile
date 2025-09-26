@@ -88,6 +88,24 @@ spec:
 
   stages {
 
+
+    stage('Sanity: GHCR push permission') {
+      container('curl') {
+        withCredentials([usernamePassword(credentialsId: 'ghcr', usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_PAT')]) {
+          sh '''
+            set -euo pipefail
+            REPO="board-${SERVICE}"  # SERVICE=user-service|file-service|post-service|frontend
+            CODE=$(curl -s -o token.json -w '%{http_code}' -u "$GHCR_USER:$GHCR_PAT" \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:drsol-ha/${REPO}:push")
+            jq -e '.token and .token != null' token.json >/dev/null || {
+              echo "ERROR: cannot get push scope to drsol-ha/${REPO} (HTTP $CODE).";
+              echo "=> 토큰 권한/SSO/조직 권한을 확인하세요."; exit 90; }
+            echo "OK: $GHCR_USER can get push scope to drsol-ha/${REPO}"
+          '''
+        }
+      }
+    }
+    
     stage('Checkout service code') {
       steps {
         container('git') {
