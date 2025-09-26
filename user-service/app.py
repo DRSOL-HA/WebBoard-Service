@@ -23,7 +23,7 @@ def register():
         password = data.get('password')
         
         if User.query.filter_by(username=username).first():
-            return jsonify({'error': '이미 존재하는 사용자입니다'}), 400
+            return jsonify({'error': '이미 존재하는 사용자입니다!'}), 400
         
         hashed_password = generate_password_hash(password)
         user = User(username=username, password=hashed_password)
