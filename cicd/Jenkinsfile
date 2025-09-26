@@ -87,25 +87,7 @@ spec:
   }
 
   stages {
-
-
-    stage('Sanity: GHCR push permission') {
-      container('curl') {
-        withCredentials([usernamePassword(credentialsId: 'ghcr', usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_PAT')]) {
-          sh '''
-            set -euo pipefail
-            REPO="board-${SERVICE}"  # SERVICE=user-service|file-service|post-service|frontend
-            CODE=$(curl -s -o token.json -w '%{http_code}' -u "$GHCR_USER:$GHCR_PAT" \
-              "https://ghcr.io/token?service=ghcr.io&scope=repository:drsol-ha/${REPO}:push")
-            jq -e '.token and .token != null' token.json >/dev/null || {
-              echo "ERROR: cannot get push scope to drsol-ha/${REPO} (HTTP $CODE).";
-              echo "=> 토큰 권한/SSO/조직 권한을 확인하세요."; exit 90; }
-            echo "OK: $GHCR_USER can get push scope to drsol-ha/${REPO}"
-          '''
-        }
-      }
-    }
-    
+  
     stage('Checkout service code') {
       steps {
         container('git') {
@@ -156,6 +138,37 @@ spec:
       }
     }
 
+
+    stage('Sanity: GHCR push permission') {
+      steps {
+        container('curl') {
+          withCredentials([usernamePassword(credentialsId: 'ghcr', usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_PAT')]) {
+            sh '''
+              set -euo pipefail
+              REPO="board-${SERVICE}"  # SERVICE=user-service | file-service | post-service | frontend
+    
+              # push scope 토큰 요청
+              HTTP=$(curl -s -o token.json -w '%{http_code}' -u "$GHCR_USER:$GHCR_PAT" \
+                "https://ghcr.io/token?service=ghcr.io&scope=repository:drsol-ha/${REPO}:push")
+    
+              # HTTP 코드 체크
+              if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 300 ]; then
+                echo "ERROR: token exchange failed (HTTP $HTTP). PAT 권한/SSO/조직 권한 확인 필요"; exit 90
+              fi
+    
+              # jq 없이 token 필드 추출(있으면 OK)
+              TOKEN=$(sed -n 's/.*"token":"\\([^"]*\\)".*/\\1/p' token.json || true)
+              if [ -z "$TOKEN" ]; then
+                echo "ERROR: push scope 토큰을 받지 못했습니다. PAT 권한 또는 조직 SSO 승인을 확인하세요."; exit 90
+              fi
+    
+              echo "OK: $GHCR_USER 계정은 drsol-ha/${REPO}에 push scope를 획득합니다."
+            '''
+          }
+        }
+      }
+    }
+    
     stage('Decide IMAGE_TAG (auto bump when empty)') {
       when { expression { return !params.IMAGE_TAG?.trim() } }
       steps {
