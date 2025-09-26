@@ -36,7 +36,7 @@ def index():
         
         return render_template('index.html', posts_data=posts_data)
     except Exception as e:
-        flash(f'오류가 발생했습니다: {str(e)}')
+        flash(f'오류가 발생했습니다!: {str(e)}')
         return render_template('index.html', posts_data={'posts': [], 'pages': 0, 'current_page': 1})
 
 @app.route('/register', methods=['GET', 'POST'])
