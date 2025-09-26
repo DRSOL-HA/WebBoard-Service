@@ -97,42 +97,37 @@ spec:
       }
     }
 
-    // 2) 변경된 서비스 감지 (최근 커밋 기준). 없으면 user-service만 빌드
+    // 2) 변경된 서비스 감지 (최근 커밋 기준).
     stage('Detect services to build') {
       steps {
-        script {
-          // 쉘에서 생성한 목록을 파일로 남김(.services)
-        }
-        sh '''
-          set -eu
-          cd src/app
-          # 최근 커밋 기준 변경 파일 목록(깃훅 트리거 시 depth=2 이므로 HEAD~1..HEAD 가능)
-          CHANGED="$(git diff --name-only HEAD~1..HEAD || true)"
-          cd - >/dev/null
-
-          SERVICES=""
-
-          for s in user-service file-service post-service frontend nginx; do
-            if printf '%s\n' "$CHANGED" | grep -E "^${s}(/|$)" >/dev/null 2>&1; then
-              SERVICES="${SERVICES}\\n${s}"
+        container('git') {
+          sh '''
+            set -eu
+            cd src/app
+            # 최근 커밋 기준 변경 파일
+            CHANGED="$(git diff --name-only HEAD~1..HEAD || true)"
+            cd - >/dev/null
+    
+            SERVICES=""
+            for s in user-service file-service post-service frontend nginx; do
+              if printf '%s\n' "$CHANGED" | grep -E "^${s}(/|$)" >/dev/null 2>&1; then
+                SERVICES="${SERVICES}\\n${s}"
+              fi
+            done
+    
+            SERVICES="$(printf '%b' "$SERVICES" | sed '/^$/d' | sort -u)"
+            printf '%s\n' "$SERVICES" > .services
+    
+            if [ ! -s .services ]; then
+              echo "No service changes detected. Skipping subsequent stages."
+            else
+              echo "빌드 대상:"
+              cat .services
             fi
-          done
-
-          # 변경 없으면 기본으로 user-service만
-          if [ -z "${SERVICES#\\n}" ]; then
-            SERVICES="user-service"
-          else
-            # 앞의 개행 제거
-            SERVICES="$(printf '%b' "$SERVICES" | sed '/^$/d')"
-          fi
-
-          printf '%s\n' "$SERVICES" > .services
-          echo "빌드 대상:"
-          cat .services
-        '''
+          '''
+        }
       }
     }
-
     // 3) (서비스별) GHCR 푸시 권한 확인
     stage('Sanity: GHCR push permission (each)') {
       steps {
