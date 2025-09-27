@@ -78,7 +78,7 @@ def login():
                 session['access_token'] = data['access_token']
                 session['user_id'] = data['user_id']
                 session['username'] = data['username']
-                flash('로그인되었습니다.')
+                flash('로그인되었습니다!!!!!!!!!!!!!!!!!!!!!')
                 return redirect(url_for('index'))
             else:
                 flash(response.json().get('error', '로그인에 실패했습니다.'))
