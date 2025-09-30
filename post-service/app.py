@@ -111,7 +111,7 @@ def create_post():
         db.session.add(post)
         db.session.commit()
         
-        return jsonify({'message': '게시글이 작성되었습니다', 'post_id': post.id}), 201
+        return jsonify({'message': '게시글이 작성되었습니다..', 'post_id': post.id}), 201
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
