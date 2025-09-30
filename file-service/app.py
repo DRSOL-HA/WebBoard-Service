@@ -14,7 +14,7 @@ app.config.from_object(Config)
 def get_s3_client():
     try:
         if app.config['S3_ENDPOINT_URL']:
-            # MinIO 등 다른 S3 호환 서비스 사용
+            # MinIO 등 다른 S3 호환 서비스 사용~
             return boto3.client(
                 's3',
                 aws_access_key_id=app.config['AWS_ACCESS_KEY_ID'],
