@@ -1,36 +1,292 @@
 {% extends "base.html" %}
 
-{% block title %}글쓰기 - 게시판{% endblock %}
+{% block title %}새 포스팅 - WebBoard{% endblock %}
 
 {% block content %}
+<style>
+    .write-container {
+        background: white;
+        border-radius: 12px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        overflow: hidden;
+        max-width: 600px;
+        margin: 0 auto;
+    }
+    
+    .write-header {
+        padding: 20px;
+        border-bottom: 1px solid var(--instagram-border);
+        text-align: center;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+    }
+    
+    .write-header h3 {
+        margin: 0;
+        font-weight: 700;
+        font-size: 24px;
+    }
+    
+    .write-body {
+        padding: 30px;
+    }
+    
+    .form-group {
+        margin-bottom: 25px;
+    }
+    
+    .form-label {
+        font-weight: 600;
+        color: #262626;
+        margin-bottom: 8px;
+        display: block;
+    }
+    
+    .form-control {
+        border: 1px solid var(--instagram-border);
+        border-radius: 8px;
+        padding: 12px 16px;
+        font-size: 15px;
+        transition: all 0.3s ease;
+        background: #fafafa;
+    }
+    
+    .form-control:focus {
+        border-color: var(--instagram-blue);
+        box-shadow: 0 0 0 3px rgba(0, 149, 246, 0.1);
+        background: white;
+    }
+    
+    .form-control::placeholder {
+        color: var(--instagram-gray);
+    }
+    
+    .file-upload-area {
+        border: 2px dashed var(--instagram-border);
+        border-radius: 12px;
+        padding: 30px;
+        text-align: center;
+        background: #fafafa;
+        transition: all 0.3s ease;
+        cursor: pointer;
+    }
+    
+    .file-upload-area:hover {
+        border-color: var(--instagram-blue);
+        background: #f0f8ff;
+    }
+    
+    .file-upload-area.dragover {
+        border-color: var(--instagram-blue);
+        background: #e3f2fd;
+    }
+    
+    .file-upload-icon {
+        font-size: 48px;
+        color: var(--instagram-gray);
+        margin-bottom: 15px;
+    }
+    
+    .file-upload-text {
+        color: #262626;
+        font-weight: 500;
+        margin-bottom: 5px;
+    }
+    
+    .file-upload-hint {
+        color: var(--instagram-gray);
+        font-size: 13px;
+    }
+    
+    .file-input {
+        display: none;
+    }
+    
+    .selected-file {
+        background: white;
+        border: 1px solid var(--instagram-border);
+        border-radius: 8px;
+        padding: 12px 16px;
+        margin-top: 10px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+    }
+    
+    .file-info {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+    
+    .remove-file {
+        background: none;
+        border: none;
+        color: #ed4956;
+        cursor: pointer;
+        font-size: 16px;
+    }
+    
+    .action-buttons {
+        display: flex;
+        gap: 12px;
+        justify-content: flex-end;
+        padding-top: 20px;
+        border-top: 1px solid var(--instagram-border);
+    }
+    
+    .btn-cancel {
+        background: #f8f9fa;
+        border: 1px solid var(--instagram-border);
+        color: #262626;
+        padding: 12px 24px;
+        border-radius: 8px;
+        text-decoration: none;
+        font-weight: 500;
+        transition: all 0.3s ease;
+    }
+    
+    .btn-cancel:hover {
+        background: #e9ecef;
+        color: #262626;
+        transform: translateY(-1px);
+    }
+    
+    .btn-submit {
+        background: var(--instagram-blue);
+        border: none;
+        color: white;
+        padding: 12px 24px;
+        border-radius: 8px;
+        font-weight: 600;
+        transition: all 0.3s ease;
+        cursor: pointer;
+    }
+    
+    .btn-submit:hover {
+        background: #0084d9;
+        transform: translateY(-1px);
+    }
+    
+    .btn-submit:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+        transform: none;
+    }
+</style>
+
 <div class="row justify-content-center">
-    <div class="col-md-8">
-        <div class="card">
-            <div class="card-header">
-                <h3>글쓰기</h3>
+    <div class="col-12">
+        <div class="write-container">
+            <div class="write-header">
+                <h3>
+                    <i class="fas fa-camera me-2"></i>
+                    새 포스팅 만들기
+                </h3>
             </div>
-            <div class="card-body">
-                <form method="POST" enctype="multipart/form-data">
-                    <div class="mb-3">
-                        <label for="title" class="form-label">제목</label>
-                        <input type="text" class="form-control" id="title" name="title" required>
+            
+            <div class="write-body">
+                <form method="POST" enctype="multipart/form-data" id="postForm">
+                    <div class="form-group">
+                        <label for="title" class="form-label">
+                            <i class="fas fa-heading me-2"></i>제목
+                        </label>
+                        <input type="text" 
+                               class="form-control" 
+                               id="title" 
+                               name="title" 
+                               placeholder="어떤 이야기를 나누고 싶나요?" 
+                               required>
                     </div>
-                    <div class="mb-3">
-                        <label for="content" class="form-label">내용</label>
-                        <textarea class="form-control" id="content" name="content" rows="10" required></textarea>
+                    
+                    <div class="form-group">
+                        <label for="content" class="form-label">
+                            <i class="fas fa-edit me-2"></i>내용
+                        </label>
+                        <textarea class="form-control" 
+                                  id="content" 
+                                  name="content" 
+                                  rows="8" 
+                                  placeholder="당신의 이야기를 들려주세요..." 
+                                  required></textarea>
                     </div>
-                    <div class="mb-3">
-                        <label for="file" class="form-label">첨부파일 (선택)</label>
-                        <input type="file" class="form-control" id="file" name="file">
-                        <div class="form-text">파일을 선택적으로 첨부할 수 있습니다.</div>
+                    
+                    <div class="form-group">
+                        <label class="form-label">
+                            <i class="fas fa-paperclip me-2"></i>첨부파일
+                        </label>
+                        <div class="file-upload-area" onclick="document.getElementById('file').click()">
+                            <div class="file-upload-icon">
+                                <i class="fas fa-cloud-upload-alt"></i>
+                            </div>
+                            <div class="file-upload-text">파일을 선택하거나 여기로 드래그하세요</div>
+                            <div class="file-upload-hint">모든 파일 형식 지원</div>
+                        </div>
+                        <input type="file" class="file-input" id="file" name="file">
+                        <div id="selectedFile" class="selected-file" style="display: none;">
+                            <div class="file-info">
+                                <i class="fas fa-file"></i>
+                                <span id="fileName"></span>
+                            </div>
+                            <button type="button" class="remove-file" onclick="removeFile()">
+                                <i class="fas fa-times"></i>
+                            </button>
+                        </div>
                     </div>
-                    <div class="d-grid gap-2 d-md-flex justify-content-md-end">
-                        <a href="{{ url_for('index') }}" class="btn btn-secondary me-md-2">취소</a>
-                        <button type="submit" class="btn btn-primary">작성</button>
+                    
+                    <div class="action-buttons">
+                        <a href="{{ url_for('index') }}" class="btn-cancel">
+                            <i class="fas fa-times me-2"></i>취소
+                        </a>
+                        <button type="submit" class="btn-submit">
+                            <i class="fas fa-paper-plane me-2"></i>게시하기
+                        </button>
                     </div>
                 </form>
             </div>
         </div>
     </div>
 </div>
+
+<script>
+    // 파일 선택 처리
+    document.getElementById('file').addEventListener('change', function(e) {
+        const file = e.target.files[0];
+        if (file) {
+            document.getElementById('fileName').textContent = file.name;
+            document.getElementById('selectedFile').style.display = 'flex';
+        }
+    });
+    
+    // 파일 제거
+    function removeFile() {
+        document.getElementById('file').value = '';
+        document.getElementById('selectedFile').style.display = 'none';
+    }
+    
+    // 드래그 앤 드롭
+    const uploadArea = document.querySelector('.file-upload-area');
+    
+    uploadArea.addEventListener('dragover', function(e) {
+        e.preventDefault();
+        this.classList.add('dragover');
+    });
+    
+    uploadArea.addEventListener('dragleave', function(e) {
+        e.preventDefault();
+        this.classList.remove('dragover');
+    });
+    
+    uploadArea.addEventListener('drop', function(e) {
+        e.preventDefault();
+        this.classList.remove('dragover');
+        
+        const files = e.dataTransfer.files;
+        if (files.length > 0) {
+            document.getElementById('file').files = files;
+            document.getElementById('fileName').textContent = files[0].name;
+            document.getElementById('selectedFile').style.display = 'flex';
+        }
+    });
+</script>
 {% endblock %}

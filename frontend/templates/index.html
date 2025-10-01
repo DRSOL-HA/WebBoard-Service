@@ -1,99 +1,273 @@
 {% extends "base.html" %}
 
 {% block content %}
-<div class="row">
-  <div class="col-12">
-    <h1>게시글 목록</h1>
+<style>
+    .post-card {
+        background: white;
+        border-radius: 12px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        margin-bottom: 24px;
+        overflow: hidden;
+        transition: transform 0.3s ease, box-shadow 0.3s ease;
+    }
     
-    <div class="table-responsive mt-4">
-      <table class="table table-striped">
-        <thead class="table-dark">
-          <tr>
-            <th>번호</th>
-            <th>제목</th>
-            <th>작성자</th>
-            <th>첨부파일</th>
-            <th>작성일</th>
-            {% if session.username %}
-            <th>관리</th>
-            {% endif %}
-          </tr>
-        </thead>
-        <tbody>
-          {# 게시글이 없을 때 #}
-          {% if posts_data.posts|length == 0 %}
-          <tr>
-            <td colspan="{% if session.username %}6{% else %}5{% endif %}" class="text-center">
-              게시글이 없습니다.
-            </td>
-          </tr>
-          {% else %}
-            {# 게시글 루프 #}
+    .post-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 8px 25px rgba(0,0,0,0.15);
+    }
+    
+    .post-header {
+        padding: 16px 20px;
+        border-bottom: 1px solid var(--instagram-border);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+    }
+    
+    .author-info {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+    }
+    
+    .author-avatar {
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        background: var(--instagram-gradient);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-weight: 600;
+        font-size: 16px;
+    }
+    
+    .author-details h6 {
+        margin: 0;
+        font-weight: 600;
+        color: #262626;
+    }
+    
+    .author-details small {
+        color: var(--instagram-gray);
+        font-size: 12px;
+    }
+    
+    .post-content {
+        padding: 20px;
+    }
+    
+    .post-title {
+        font-size: 18px;
+        font-weight: 600;
+        color: #262626;
+        margin-bottom: 12px;
+        line-height: 1.4;
+    }
+    
+    .post-preview {
+        color: #666;
+        line-height: 1.5;
+        margin-bottom: 16px;
+    }
+    
+    .post-actions {
+        padding: 12px 20px;
+        border-top: 1px solid var(--instagram-border);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+    }
+    
+    .action-buttons {
+        display: flex;
+        gap: 12px;
+    }
+    
+    .action-btn {
+        background: none;
+        border: none;
+        color: var(--instagram-gray);
+        font-size: 18px;
+        cursor: pointer;
+        transition: color 0.3s ease;
+        text-decoration: none;
+    }
+    
+    .action-btn:hover {
+        color: #262626;
+    }
+    
+    .file-attachment {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        background: #f0f2f5;
+        padding: 6px 12px;
+        border-radius: 20px;
+        font-size: 12px;
+        color: #666;
+        text-decoration: none;
+        transition: background 0.3s ease;
+    }
+    
+    .file-attachment:hover {
+        background: #e4e6ea;
+        color: #666;
+    }
+    
+    .empty-state {
+        text-align: center;
+        padding: 60px 20px;
+        color: var(--instagram-gray);
+    }
+    
+    .empty-state i {
+        font-size: 64px;
+        margin-bottom: 20px;
+        opacity: 0.5;
+    }
+    
+    .pagination {
+        justify-content: center;
+        margin-top: 40px;
+    }
+    
+    .page-link {
+        border: none;
+        color: #262626;
+        background: white;
+        border-radius: 8px;
+        margin: 0 4px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        transition: all 0.3s ease;
+    }
+    
+    .page-link:hover {
+        background: var(--instagram-blue);
+        color: white;
+        transform: translateY(-1px);
+    }
+    
+    .page-item.active .page-link {
+        background: var(--instagram-blue);
+        border-color: var(--instagram-blue);
+    }
+</style>
+
+<div class="row justify-content-center">
+    <div class="col-lg-8">
+        {% if posts_data.posts|length == 0 %}
+            <div class="main-content">
+                <div class="empty-state">
+                    <i class="fas fa-camera"></i>
+                    <h4>아직 포스팅이 없어요</h4>
+                    <p>첫 번째 포스팅을 올려보세요!</p>
+                    {% if session.username %}
+                        <a href="{{ url_for('write') }}" class="nav-btn nav-btn-primary mt-3">
+                            <i class="fas fa-plus"></i> 첫 포스팅 올리기
+                        </a>
+                    {% endif %}
+                </div>
+            </div>
+        {% else %}
             {% for post in posts_data.posts %}
-            <tr>
-              <td>{{ post.id }}</td>
-              <td>
-                <a href="{{ url_for('view_post', post_id=post.id) }}" class="text-decoration-none">
-                  {{ post.title }}
-                </a>
-              </td>
-              <td>{{ post.author_name }}</td>
-              <td>
-                {% if post.file_id %}
-                <a href="{{ url_for('download_file', file_id=post.file_id) }}"
-                   class="btn btn-sm btn-outline-primary">
-                  {{ post.file_name }}
-                </a>
-                {% endif %}
-              </td>
-              <td>{{ post.created_at }}</td>
-              {% if session.username %}
-              <td>
-                <a href="{{ url_for('delete_post', post_id=post.id) }}"
-                   class="btn btn-sm btn-danger"
-                   onclick="return confirm('정말 삭제하시겠습니까?');">
-                  삭제
-                </a>
-              </td>
-              {% endif %}
-            </tr>
+            <div class="post-card">
+                <div class="post-header">
+                    <div class="author-info">
+                        <div class="author-avatar">
+                            {{ post.author_name[0].upper() }}
+                        </div>
+                        <div class="author-details">
+                            <h6>{{ post.author_name }}</h6>
+                            <small>{{ post.created_at[:10] }}</small>
+                        </div>
+                    </div>
+                    {% if session.user_id == post.author_id %}
+                    <div class="dropdown">
+                        <button class="action-btn" data-bs-toggle="dropdown">
+                            <i class="fas fa-ellipsis-h"></i>
+                        </button>
+                        <ul class="dropdown-menu">
+                            <li>
+                                <a class="dropdown-item text-danger" 
+                                   href="{{ url_for('delete_post', post_id=post.id) }}"
+                                   onclick="return confirm('정말 삭제하시겠습니까?')">
+                                    <i class="fas fa-trash me-2"></i>삭제
+                                </a>
+                            </li>
+                        </ul>
+                    </div>
+                    {% endif %}
+                </div>
+                
+                <div class="post-content">
+                    <h5 class="post-title">{{ post.title }}</h5>
+                    <div class="post-preview">
+                        {% set content_preview = post.content[:150] %}
+                        {{ content_preview }}{% if post.content|length > 150 %}...{% endif %}
+                    </div>
+                    {% if post.file_id %}
+                    <a href="{{ url_for('download_file', file_id=post.file_id) }}" class="file-attachment">
+                        <i class="fas fa-paperclip"></i>
+                        {{ post.file_name }}
+                    </a>
+                    {% endif %}
+                </div>
+                
+                <div class="post-actions">
+                    <div class="action-buttons">
+                        <a href="{{ url_for('view_post', post_id=post.id) }}" class="action-btn">
+                            <i class="far fa-eye"></i>
+                        </a>
+                        <button class="action-btn">
+                            <i class="far fa-heart"></i>
+                        </button>
+                        <button class="action-btn">
+                            <i class="far fa-comment"></i>
+                        </button>
+                    </div>
+                    <small class="text-muted">#{{ post.id }}</small>
+                </div>
+            </div>
             {% endfor %}
-          {% endif %}
-        </tbody>
-      </table>
+        {% endif %}
+        
+        {# 페이징 #}
+        {% if posts_data.pages > 1 %}
+        <nav aria-label="Page navigation">
+            <ul class="pagination">
+                {% if posts_data.current_page > 1 %}
+                <li class="page-item">
+                    <a class="page-link" href="{{ url_for('index', page=posts_data.current_page-1) }}">
+                        <i class="fas fa-chevron-left"></i>
+                    </a>
+                </li>
+                {% endif %}
+
+                {% for page_num in range(1, posts_data.pages + 1) %}
+                    {% if page_num == posts_data.current_page %}
+                    <li class="page-item active">
+                        <span class="page-link">{{ page_num }}</span>
+                    </li>
+                    {% else %}
+                    <li class="page-item">
+                        <a class="page-link" href="{{ url_for('index', page=page_num) }}">{{ page_num }}</a>
+                    </li>
+                    {% endif %}
+                {% endfor %}
+
+                {% if posts_data.current_page < posts_data.pages %}
+                <li class="page-item">
+                    <a class="page-link" href="{{ url_for('index', page=posts_data.current_page+1) }}">
+                        <i class="fas fa-chevron-right"></i>
+                    </a>
+                </li>
+                {% endif %}
+            </ul>
+        </nav>
+        {% endif %}
     </div>
-
-    {# 페이징 #}
-    {% if posts_data.pages > 1 %}
-    <nav aria-label="Page navigation">
-      <ul class="pagination justify-content-center">
-        {% if posts_data.current_page > 1 %}
-        <li class="page-item">
-          <a class="page-link" href="{{ url_for('index', page=posts_data.current_page-1) }}">이전</a>
-        </li>
-        {% endif %}
-
-        {% for page_num in range(1, posts_data.pages + 1) %}
-          {% if page_num == posts_data.current_page %}
-          <li class="page-item active">
-            <span class="page-link">{{ page_num }}</span>
-          </li>
-          {% else %}
-          <li class="page-item">
-            <a class="page-link" href="{{ url_for('index', page=page_num) }}">{{ page_num }}</a>
-          </li>
-          {% endif %}
-        {% endfor %}
-
-        {% if posts_data.current_page < posts_data.pages %}
-        <li class="page-item">
-          <a class="page-link" href="{{ url_for('index', page=posts_data.current_page+1) }}">다음</a>
-        </li>
-        {% endif %}
-      </ul>
-    </nav>
-    {% endif %}
-
-  </div>
 </div>
 {% endblock %}
